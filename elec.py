@@ -125,6 +125,7 @@ def print_help():
     w       启动 PWM，并回到约 1500 us
 
 本地控制（不会发送给 STM32）：
+    c       输入夹爪开度 0..100（0=闭合，100=最大张开）
     ?       显示帮助
     Ctrl+L  显示/隐藏 STM32 实时日志
     Ctrl+C  退出程序，并自动发送 s 停车
@@ -156,23 +157,58 @@ print("STM32 串口已打开")
 
 running = True
 show_logs = False
+rx_line = bytearray()
+
+
+def write_stm32(payload, description):
+    """安全写串口，USB 断开时给出简洁提示而不是 traceback。"""
+    if not ser.is_open:
+        print(f"\n发送失败（{description}）：STM32 串口已关闭")
+        return False
+
+    try:
+        ser.write(payload)
+        ser.flush()
+        return True
+    except (OSError, serial.SerialException) as exc:
+        print(f"\n发送失败（{description}）：{exc}")
+        print("请检查车辆总电和 STM32 USB 连接，然后重新运行本程序。")
+        return False
 
 
 def serial_reader():
+    global running
+
     while running:
         try:
             data = ser.read(ser.in_waiting or 1)
 
-            if data and show_logs:
-                text = data.decode(
-                    'utf-8',
-                    errors='replace'
-                )
+            if not data:
+                continue
 
-                sys.stdout.write(text)
+            if show_logs:
+                sys.stdout.write(data.decode('utf-8', errors='replace'))
                 sys.stdout.flush()
+                continue
 
-        except serial.SerialException:
+            # 测速日志隐藏时，仍显示夹爪命令的确认和错误。
+            for value in data:
+                if value in (10, 13):
+                    if rx_line:
+                        line = rx_line.decode('utf-8', errors='replace').strip()
+                        rx_line.clear()
+                        if line and ('CLAW' in line or line.startswith('ERR')):
+                            print(f"\n{line}")
+                elif len(rx_line) < 512:
+                    rx_line.append(value)
+                else:
+                    rx_line.clear()
+
+        except (OSError, serial.SerialException) as exc:
+            if running:
+                print(f"\nSTM32 串口连接中断：{exc}")
+                print("请检查车辆总电和 USB 连接，然后重新运行本程序。")
+            running = False
             break
 
 
@@ -197,7 +233,7 @@ try:
 
     print_help()
 
-    while True:
+    while running:
         key = sys.stdin.read(1)
 
         # Ctrl + L
@@ -216,30 +252,56 @@ try:
             print_help()
             continue
 
+        # c 是树莓派本地交互命令，不作为单字符直接发送。
+        # 暂时恢复普通终端模式，方便输入多位百分比和按回车确认。
+        if key.lower() == 'c':
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            try:
+                value = input(
+                    "\n请输入夹爪开度 0～100（直接回车取消）："
+                ).strip()
+            finally:
+                tty.setcbreak(fd)
+
+            if not value:
+                print("已取消夹爪命令")
+                continue
+
+            try:
+                percent = int(value, 10)
+            except ValueError:
+                print("输入无效：请输入 0～100 的整数")
+                continue
+
+            if not 0 <= percent <= 100:
+                print("输入越界：夹爪开度必须在 0～100 之间")
+                continue
+
+            command = f"CLAW,{percent}\r\n".encode('ascii')
+            if write_stm32(command, f"夹爪开度 {percent}%"):
+                print(f"TX [CLAW,{percent}] -> 夹爪开度 {percent}%")
+            continue
+
         # STM32 已定义命令
         if key in COMMANDS:
-            ser.write(key.encode('ascii'))
-            ser.flush()
-
-            print(
-                f"\rTX [{key}] -> {COMMANDS[key]}"
-            )
+            if write_stm32(key.encode('ascii'), COMMANDS[key]):
+                print(f"\rTX [{key}] -> {COMMANDS[key]}")
 
 except KeyboardInterrupt:
     print("\n收到退出指令")
 
 finally:
     # 无论为什么退出，都尝试先停车
-    try:
-        ser.write(b's')
-        ser.flush()
+    if write_stm32(b's', '退出前停车'):
         print("已发送 s：停止双轮")
-    except Exception:
-        pass
 
     running = False
 
-    ser.close()
+    try:
+        if ser.is_open:
+            ser.close()
+    except (OSError, serial.SerialException):
+        pass
 
     termios.tcsetattr(
         fd,
