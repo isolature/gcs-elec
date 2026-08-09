@@ -8,6 +8,8 @@ import termios
 import threading
 import serial
 
+from car_control import CarControl
+
 
 # ============================================================
 # STM32 当前已有的单字符命令
@@ -124,11 +126,8 @@ port = find_stm32()
 
 print(f"发现 STM32: {port}")
 
-ser = serial.Serial(
-    port=port,
-    baudrate=115200,
-    timeout=0.1
-)
+car = CarControl(port=port)
+ser = car.serial
 
 print("STM32 串口已打开")
 
@@ -142,46 +141,34 @@ show_logs = False
 rx_line = bytearray()
 
 
-def write_stm32(payload, description):
-    """安全写串口，USB 断开时给出简洁提示而不是 traceback。"""
-    if not ser.is_open:
-        print(f"\n发送失败（{description}）：STM32 串口已关闭")
-        return False
-
-    try:
-        ser.write(payload)
-        ser.flush()
-        return True
-    except (OSError, serial.SerialException) as exc:
-        print(f"\n发送失败（{description}）：{exc}")
-        print("请检查车辆总电和 STM32 USB 连接，然后重新运行本程序。")
-        return False
-
-
 def send_wheel_targets(left_rpm, right_rpm):
-    """发送左右轮独立目标；视觉程序也可以复用这个接口。"""
-    for name, rpm in (("左轮", left_rpm), ("右轮", right_rpm)):
-        if not -108 <= rpm <= 108:
-            raise ValueError(f"{name} RPM 必须在 -108～108 之间")
-        if rpm != 0 and abs(rpm) < 20:
-            raise ValueError(f"{name}非零 RPM 的绝对值必须在 20～108 之间")
-
-    command_text = f"WHEEL,{left_rpm},{right_rpm}"
+    """交互界面适配器：实际协议由 CarControl 负责。"""
     description = f"左右轮独立目标：L={left_rpm:+d}, R={right_rpm:+d} RPM"
-    return write_stm32(
-        f"{command_text}\r\n".encode('ascii'), description
-    )
+    try:
+        return car.set_wheels(left_rpm, right_rpm)
+    except (OSError, serial.SerialException, ConnectionError) as exc:
+        print(f"\n发送失败（{description}）：{exc}")
+        return False
 
 
 def send_fixed_action(action):
-    """发送写死的前进、后退、左转、右转或停车动作。"""
+    """交互界面适配器：把按键映射到 CarControl 动作。"""
     action = action.upper()
     if action not in ('F', 'B', 'L', 'R', '0'):
         raise ValueError("动作必须是 F/B/L/R/0")
     description = FIXED_ACTIONS[action][1]
-    return write_stm32(
-        f"AUTO,{action}\r\n".encode('ascii'), description
-    )
+    methods = {
+        'F': car.forward,
+        'B': car.backward,
+        'L': car.turn_left,
+        'R': car.turn_right,
+        '0': car.stop,
+    }
+    try:
+        return methods[action]()
+    except (OSError, serial.SerialException, ConnectionError) as exc:
+        print(f"\n发送失败（{description}）：{exc}")
+        return False
 
 
 def serial_reader():
@@ -352,9 +339,12 @@ try:
                 continue
 
             command_text = f"DRIVE,{rpm},{mode}"
-            if write_stm32(
-                f"{command_text}\r\n".encode('ascii'), description
-            ):
+            try:
+                sent = car.drive(rpm, sync=(mode == 'L'))
+            except (OSError, serial.SerialException, ConnectionError) as exc:
+                print(f"发送失败（{description}）：{exc}")
+                sent = False
+            if sent:
                 print(f"TX [{command_text}] -> {description}")
             continue
 
@@ -383,14 +373,23 @@ try:
                 print("输入越界：夹爪开度必须在 0～100 之间")
                 continue
 
-            command = f"CLAW,{percent}\r\n".encode('ascii')
-            if write_stm32(command, f"夹爪开度 {percent}%"):
+            try:
+                sent = car.set_claw(percent)
+            except (OSError, serial.SerialException, ConnectionError) as exc:
+                print(f"发送失败（夹爪开度 {percent}%）：{exc}")
+                sent = False
+            if sent:
                 print(f"TX [CLAW,{percent}] -> 夹爪开度 {percent}%")
             continue
 
         # STM32 已定义命令
         if key in COMMANDS:
-            if write_stm32(key.encode('ascii'), COMMANDS[key]):
+            try:
+                sent = car.send_raw_key(key)
+            except (OSError, serial.SerialException, ConnectionError) as exc:
+                print(f"发送失败（{COMMANDS[key]}）：{exc}")
+                sent = False
+            if sent:
                 print(f"\rTX [{key}] -> {COMMANDS[key]}")
 
 except KeyboardInterrupt:
@@ -398,14 +397,17 @@ except KeyboardInterrupt:
 
 finally:
     # 无论为什么退出，都尝试先停车
-    if write_stm32(b's', '退出前停车'):
+    try:
+        stopped = car.emergency_stop()
+    except (OSError, serial.SerialException, ConnectionError):
+        stopped = False
+    if stopped:
         print("已发送 s：停止双轮")
 
     running = False
 
     try:
-        if ser.is_open:
-            ser.close()
+        car.close(stop=False)
     except (OSError, serial.SerialException):
         pass
 
