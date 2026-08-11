@@ -10,7 +10,7 @@ import time
 
 MAGIC = b"RC"
 PROTOCOL_VERSION = 1
-SCHEMA_HASH = 0x7671E0E1
+SCHEMA_HASH = 0x90245540
 HEADER_SIZE = 32
 CRC_SIZE = 4
 MAX_DECODED_SIZE = 4096
@@ -19,6 +19,7 @@ MSG_HELLO = 0x0001
 MSG_HELLO_ACK = 0x0002
 MSG_ARM_COMMAND = 0x0010
 MSG_CHASSIS_SETPOINT = 0x0011
+MSG_GRIPPER_COMMAND = 0x0012
 MSG_SAFE_STOP = 0x0013
 MSG_HEARTBEAT = 0x0014
 MSG_COMMAND_RESULT = 0x0080
@@ -71,6 +72,8 @@ ARM_TARGET_DISARMED = 1
 ARM_TARGET_ARMED = 2
 SAFE_STOP_REASON_USER_REQUEST = 1
 UPPER_CONTROL_STATE_ACTIVE = 3
+GRIPPER_TARGET_OPEN = 1
+GRIPPER_TARGET_CLOSED = 2
 
 DEFAULT_SESSION_ID = 0x12345678
 DEFAULT_SEQ = 1
@@ -407,6 +410,7 @@ def print_command_result(wire, expected_session_id, expected_command_id):
     if reason not in COMMAND_RESULT_REASON_NAMES:
         raise ValueError("COMMAND_RESULT reason is invalid")
     print("COMMAND_RESULT valid: command ID, status, reason and CRC all match")
+    return status, reason
 
 
 def build_heartbeat_payload(heartbeat_seq):
@@ -418,6 +422,17 @@ def build_heartbeat_payload(heartbeat_seq):
         + b"\x10"
         + encode_varint(UPPER_CONTROL_STATE_ACTIVE)
     )
+
+
+def build_gripper_payload(target_name, command_id):
+    if command_id == 0:
+        raise ValueError("command_id must be non-zero")
+    target = (
+        GRIPPER_TARGET_OPEN
+        if target_name == "open"
+        else GRIPPER_TARGET_CLOSED
+    )
+    return b"\x08" + encode_varint(target) + b"\x10" + encode_varint(command_id)
 
 
 def decode_heartbeat_ack(payload):
@@ -783,6 +798,135 @@ def run_watchdog_test(serial_module, port, args):
     )
 
 
+def run_gripper_test(serial_module, port, args):
+    """Establish control, command one gripper target, then disarm cleanly."""
+    receive_buffer = bytearray()
+    frame_seq = args.seq
+    heartbeat_seq = 1
+    duration_s = args.duration_s if args.duration_s > 0.0 else 1.5
+    period_s = 1.0 / args.rate_hz
+    expected_percent = 100 if args.gripper_target == "open" else 0
+    target_seen = False
+
+    def send_frame(stm32, msg_type, payload):
+        nonlocal frame_seq
+        _, wire = build_wire_frame(
+            payload=payload,
+            msg_type=msg_type,
+            session_id=args.session_id,
+            seq=frame_seq,
+            source_timestamp_us=args.timestamp_us,
+        )
+        frame_seq = (frame_seq + 1) & 0xFFFFFFFF
+        stm32.write(wire)
+        stm32.flush()
+
+    print("Draft v0.1 GRIPPER TEST")
+    print(f"schema hash    : 0x{SCHEMA_HASH:08X}")
+    print(f"target         : {args.gripper_target.upper()}")
+    print(f"expected target: {expected_percent}%")
+
+    with serial_module.Serial(port=port, baudrate=115200, timeout=0.02) as stm32:
+        stm32.reset_input_buffer()
+
+        send_frame(stm32, MSG_HELLO, b"")
+        wire = wait_for_reply(
+            stm32, receive_buffer, MSG_HELLO_ACK, args.session_id, 1.0
+        )
+        if not wire:
+            raise SystemExit("gripper test failed: no HELLO_ACK")
+        print_hello_ack(wire, args.session_id)
+
+        _, arm_payload = build_command_payload(
+            "arm", args.command_id, 0, 0, args.ttl_ms
+        )
+        send_frame(stm32, MSG_ARM_COMMAND, arm_payload)
+        wire = wait_for_reply(
+            stm32, receive_buffer, MSG_COMMAND_RESULT, args.session_id, 1.0
+        )
+        if not wire:
+            raise SystemExit("gripper test failed: no ARM COMMAND_RESULT")
+        status, _ = print_command_result(
+            wire, args.session_id, args.command_id
+        )
+        if status != COMMAND_RESULT_STATUS_ACCEPTED:
+            raise SystemExit("gripper test failed: ARM was rejected")
+
+        # Feed the newly armed watchdog before sending the actuator command.
+        send_frame(
+            stm32,
+            MSG_HEARTBEAT,
+            build_heartbeat_payload(heartbeat_seq),
+        )
+        heartbeat_seq += 1
+        send_frame(
+            stm32,
+            MSG_GRIPPER_COMMAND,
+            build_gripper_payload(args.gripper_target, args.command_id + 1),
+        )
+        wire = wait_for_reply(
+            stm32, receive_buffer, MSG_COMMAND_RESULT, args.session_id, 1.0
+        )
+        if not wire:
+            raise SystemExit("gripper test failed: no GRIPPER COMMAND_RESULT")
+        status, _ = print_command_result(
+            wire, args.session_id, args.command_id + 1
+        )
+        if status != COMMAND_RESULT_STATUS_ACCEPTED:
+            raise SystemExit("gripper test failed: GRIPPER_COMMAND was rejected")
+
+        start_time = time.monotonic()
+        stop_time = start_time + duration_s
+        next_send_time = start_time
+        while next_send_time < stop_time:
+            delay_s = next_send_time - time.monotonic()
+            if delay_s > 0.0:
+                time.sleep(delay_s)
+            send_frame(
+                stm32,
+                MSG_HEARTBEAT,
+                build_heartbeat_payload(heartbeat_seq),
+            )
+            heartbeat_seq += 1
+            next_send_time += period_s
+
+            read_deadline = min(next_send_time, stop_time)
+            while time.monotonic() < read_deadline:
+                wire = read_next_wire_frame(stm32, receive_buffer, read_deadline)
+                if not wire:
+                    break
+                reply = parse_wire_reply(wire)
+                if reply["msg_type"] == MSG_HEARTBEAT_ACK:
+                    print_heartbeat_ack(wire, args.session_id)
+                elif reply["msg_type"] == MSG_SAFETY_STATUS:
+                    print_safety_status(wire, args.session_id)
+                elif reply["msg_type"] == MSG_ROBOT_STATE:
+                    state = print_robot_state(wire, args.session_id)
+                    if state["gripper_target_percent"] == expected_percent:
+                        target_seen = True
+
+        # End the test deliberately so watchdog loss is not mistaken for a fault.
+        _, disarm_payload = build_command_payload(
+            "disarm", args.command_id + 2, 0, 0, args.ttl_ms
+        )
+        send_frame(stm32, MSG_ARM_COMMAND, disarm_payload)
+        wire = wait_for_reply(
+            stm32, receive_buffer, MSG_COMMAND_RESULT, args.session_id, 1.0
+        )
+        if not wire:
+            raise SystemExit("gripper test failed: no DISARM COMMAND_RESULT")
+        print_command_result(wire, args.session_id, args.command_id + 2)
+
+    if not target_seen:
+        raise SystemExit(
+            "gripper test failed: ROBOT_STATE did not report the target percent"
+        )
+    print(
+        "GRIPPER TEST PASSED: command accepted, target reported, "
+        "and the test ended DISARMED"
+    )
+
+
 def self_check():
     if struct.calcsize("<2sBBHHIIIQHH") != HEADER_SIZE:
         raise RuntimeError("Draft header is not 32 bytes")
@@ -820,6 +964,7 @@ def main():
             "chassis",
             "safe-stop",
             "watchdog-test",
+            "gripper-test",
         ),
         default="hello",
         help="message to build; default: hello",
@@ -838,12 +983,18 @@ def main():
     parser.add_argument("--angular-mrad-s", type=int, default=0)
     parser.add_argument("--ttl-ms", type=int, default=200)
     parser.add_argument(
+        "--gripper-target",
+        choices=("open", "closed"),
+        default="open",
+        help="target used by gripper-test; default: open",
+    )
+    parser.add_argument(
         "--duration-s",
         type=float,
         default=0.0,
         help=(
-            "repeat a chassis command, or feed watchdog-test heartbeats, "
-            "for this many seconds"
+            "repeat a chassis command, feed watchdog-test heartbeats, or "
+            "observe gripper-test for this many seconds"
         ),
     )
     parser.add_argument(
@@ -877,27 +1028,37 @@ def main():
     if args.duration_s > 0.0 and args.message not in (
         "chassis",
         "watchdog-test",
+        "gripper-test",
     ):
         parser.error(
-            "--duration-s is only supported for chassis and watchdog-test"
+            "--duration-s is only supported for chassis, watchdog-test "
+            "and gripper-test"
         )
     if args.duration_s > 0.0 and args.send is None:
         parser.error("--duration-s requires --send [PORT]")
     if args.message == "watchdog-test" and args.send is None:
         parser.error("watchdog-test requires --send [PORT]")
+    if args.message == "gripper-test" and args.send is None:
+        parser.error("gripper-test requires --send [PORT]")
     if not 1.0 <= args.rate_hz <= 100.0:
         parser.error("--rate-hz must be in 1..100")
     if args.duration_s > 0.0 and args.bad_crc:
         parser.error("--bad-crc cannot be combined with --duration-s")
     if args.message == "watchdog-test" and args.bad_crc:
         parser.error("--bad-crc cannot be combined with watchdog-test")
+    if args.message == "gripper-test" and args.bad_crc:
+        parser.error("--bad-crc cannot be combined with gripper-test")
     if args.duration_s > 0.0 and args.ttl_ms <= (1000.0 / args.rate_hz):
         parser.error("--ttl-ms must be longer than one repeat interval")
-    if args.message == "watchdog-test" and (1000.0 / args.rate_hz) >= 300.0:
-        parser.error("watchdog-test heartbeat interval must be below 300 ms")
+    if args.message in ("watchdog-test", "gripper-test") and (
+        1000.0 / args.rate_hz
+    ) >= 300.0:
+        parser.error("heartbeat interval must be below 300 ms")
+    if args.message == "gripper-test" and not 1 <= args.command_id <= 0xFFFFFFFD:
+        parser.error("gripper-test command ID must be in 1..0xFFFFFFFD")
 
     self_check()
-    if args.message == "watchdog-test":
+    if args.message in ("watchdog-test", "gripper-test"):
         try:
             import serial
         except ImportError as exc:
@@ -906,7 +1067,10 @@ def main():
             ) from exc
 
         port = find_stm32() if args.send == "auto" else args.send
-        run_watchdog_test(serial, port, args)
+        if args.message == "watchdog-test":
+            run_watchdog_test(serial, port, args)
+        else:
+            run_gripper_test(serial, port, args)
         return
 
     msg_type, payload = build_command_payload(
