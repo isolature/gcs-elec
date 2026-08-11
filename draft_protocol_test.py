@@ -10,7 +10,7 @@ import time
 
 MAGIC = b"RC"
 PROTOCOL_VERSION = 1
-SCHEMA_HASH = 0x5310372D
+SCHEMA_HASH = 0x7ECBC8FD
 HEADER_SIZE = 32
 CRC_SIZE = 4
 MAX_DECODED_SIZE = 4096
@@ -21,6 +21,7 @@ MSG_ARM_COMMAND = 0x0010
 MSG_CHASSIS_SETPOINT = 0x0011
 MSG_SAFE_STOP = 0x0013
 MSG_COMMAND_RESULT = 0x0080
+MSG_ROBOT_STATE = 0x0081
 MSG_SAFETY_STATUS = 0x0082
 
 COMMAND_RESULT_STATUS_ACCEPTED = 1
@@ -53,6 +54,15 @@ SAFETY_STOP_REASON_NAMES = {
     8: "UNDERVOLTAGE",
     9: "INVALID_COMMAND",
     10: "PHYSICAL_ESTOP",
+}
+
+GRIPPER_STATE_NAMES = {
+    1: "OPEN",
+    2: "CLOSED",
+    3: "OPENING",
+    4: "CLOSING",
+    5: "UNKNOWN",
+    6: "FAULT",
 }
 
 ARM_TARGET_DISARMED = 1
@@ -149,6 +159,11 @@ def decode_varint(data, offset):
         if not byte & 0x80:
             return value, offset
     raise ValueError("Protobuf varint is too long")
+
+
+def decode_sint32(value):
+    value &= 0xFFFFFFFF
+    return (value >> 1) ^ -(value & 1)
 
 
 def encode_sint32(value):
@@ -453,6 +468,85 @@ def print_safety_status(wire, expected_session_id):
     return status
 
 
+def decode_robot_state(payload):
+    fields = {}
+    offset = 0
+    while offset < len(payload):
+        key, offset = decode_varint(payload, offset)
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if field_number == 0:
+            raise ValueError("ROBOT_STATE has field number zero")
+
+        if wire_type == 0:
+            fields[field_number], offset = decode_varint(payload, offset)
+        elif wire_type == 1:
+            if offset + 8 > len(payload):
+                raise ValueError("truncated ROBOT_STATE fixed64 field")
+            fields[field_number] = struct.unpack_from("<Q", payload, offset)[0]
+            offset += 8
+        elif wire_type == 5:
+            if offset + 4 > len(payload):
+                raise ValueError("truncated ROBOT_STATE fixed32 field")
+            fields[field_number] = struct.unpack_from("<I", payload, offset)[0]
+            offset += 4
+        else:
+            raise ValueError("unsupported ROBOT_STATE Protobuf wire type")
+
+    return {
+        "state_seq": fields.get(1, 0),
+        "timestamp_us": fields.get(2, 0),
+        "coordinate_frame": fields.get(3, 0),
+        "last_command_seq": fields.get(4, 0),
+        "linear_mm_s": decode_sint32(fields.get(5, 0)),
+        "angular_mrad_s": decode_sint32(fields.get(6, 0)),
+        "delta_x_mm": decode_sint32(fields.get(7, 0)),
+        "delta_y_mm": decode_sint32(fields.get(8, 0)),
+        "delta_yaw_mrad": decode_sint32(fields.get(9, 0)),
+        "yaw_mrad": decode_sint32(fields.get(10, 0)),
+        "yaw_rate_mrad_s": decode_sint32(fields.get(11, 0)),
+        "gripper_state": fields.get(12, 0),
+        "validity_flags": fields.get(13, 0),
+        "gripper_target_percent": fields.get(14, 0),
+        "left_rpm_x10": decode_sint32(fields.get(15, 0)),
+        "right_rpm_x10": decode_sint32(fields.get(16, 0)),
+    }
+
+
+def print_robot_state(wire, expected_session_id):
+    reply = parse_wire_reply(wire)
+    if reply["msg_type"] != MSG_ROBOT_STATE:
+        raise ValueError("reply is not ROBOT_STATE")
+    if reply["schema_hash"] != SCHEMA_HASH:
+        raise ValueError("ROBOT_STATE schema hash does not match")
+    if reply["session_id"] != expected_session_id:
+        raise ValueError("ROBOT_STATE session ID does not match")
+
+    state = decode_robot_state(reply["payload"])
+    gripper_name = GRIPPER_STATE_NAMES.get(
+        state["gripper_state"], f"UNKNOWN({state['gripper_state']})"
+    )
+    frame_name = "BASE_LINK" if state["coordinate_frame"] == 1 else (
+        f"UNKNOWN({state['coordinate_frame']})"
+    )
+    print(
+        "ROBOT_STATE   "
+        f"seq={reply['seq']} "
+        f"state_seq={state['state_seq']} "
+        f"t_us={state['timestamp_us']} "
+        f"frame={frame_name} "
+        f"last_cmd={state['last_command_seq']} "
+        f"linear={state['linear_mm_s']}mm/s "
+        f"angular={state['angular_mrad_s']}mrad/s "
+        f"left_rpm_x10={state['left_rpm_x10']} "
+        f"right_rpm_x10={state['right_rpm_x10']} "
+        f"gripper={gripper_name} "
+        f"target={state['gripper_target_percent']}% "
+        f"validity=0x{state['validity_flags']:08X}"
+    )
+    return state
+
+
 def read_next_wire_frame(stm32, buffered, deadline):
     while time.monotonic() < deadline:
         delimiter = buffered.find(0)
@@ -479,15 +573,19 @@ def wait_for_reply(stm32, buffered, expected_msg_type, session_id, timeout_s):
         if reply["msg_type"] == MSG_SAFETY_STATUS:
             print_safety_status(wire, session_id)
             continue
+        if reply["msg_type"] == MSG_ROBOT_STATE:
+            print_robot_state(wire, session_id)
+            continue
         if reply["msg_type"] == expected_msg_type:
             return wire
         print(f"ignored unexpected reply type 0x{reply['msg_type']:04X}")
     return b""
 
 
-def listen_for_safety_status(stm32, buffered, session_id, duration_s):
+def listen_for_telemetry(stm32, buffered, session_id, duration_s):
     deadline = time.monotonic() + duration_s
-    count = 0
+    safety_count = 0
+    robot_count = 0
     while time.monotonic() < deadline:
         wire = read_next_wire_frame(stm32, buffered, deadline)
         if not wire:
@@ -495,8 +593,14 @@ def listen_for_safety_status(stm32, buffered, session_id, duration_s):
         reply = parse_wire_reply(wire)
         if reply["msg_type"] == MSG_SAFETY_STATUS:
             print_safety_status(wire, session_id)
-            count += 1
-    print(f"received {count} SAFETY_STATUS frame(s) in {duration_s:g} s")
+            safety_count += 1
+        elif reply["msg_type"] == MSG_ROBOT_STATE:
+            print_robot_state(wire, session_id)
+            robot_count += 1
+    print(
+        f"received {safety_count} SAFETY_STATUS and "
+        f"{robot_count} ROBOT_STATE frame(s) in {duration_s:g} s"
+    )
 
 
 def self_check():
@@ -565,7 +669,7 @@ def main():
         "--listen-s",
         type=float,
         default=0.0,
-        help="after the reply, print SAFETY_STATUS frames for this many seconds",
+        help="after the reply, print safety and robot state for this many seconds",
     )
     parser.add_argument(
         "--bad-crc",
@@ -695,7 +799,7 @@ def main():
             )
 
         if args.listen_s > 0.0:
-            listen_for_safety_status(
+            listen_for_telemetry(
                 stm32,
                 receive_buffer,
                 args.session_id,
