@@ -10,7 +10,7 @@ import time
 
 MAGIC = b"RC"
 PROTOCOL_VERSION = 1
-SCHEMA_HASH = 0x59C88A67
+SCHEMA_HASH = 0x5310372D
 HEADER_SIZE = 32
 CRC_SIZE = 4
 MAX_DECODED_SIZE = 4096
@@ -21,6 +21,7 @@ MSG_ARM_COMMAND = 0x0010
 MSG_CHASSIS_SETPOINT = 0x0011
 MSG_SAFE_STOP = 0x0013
 MSG_COMMAND_RESULT = 0x0080
+MSG_SAFETY_STATUS = 0x0082
 
 COMMAND_RESULT_STATUS_ACCEPTED = 1
 COMMAND_RESULT_STATUS_REJECTED = 2
@@ -32,6 +33,26 @@ COMMAND_RESULT_REASON_NAMES = {
     4: "FAULT",
     5: "NOT_CONFIGURED",
     6: "INVALID_ARGUMENT",
+}
+
+SAFETY_STATE_NAMES = {
+    1: "DISARMED",
+    2: "ARMED",
+    3: "SAFE_STOP",
+    4: "FAULT",
+}
+
+SAFETY_STOP_REASON_NAMES = {
+    1: "NONE",
+    2: "USER_STOP",
+    3: "COMMAND_TIMEOUT",
+    4: "HEARTBEAT_LOST",
+    5: "UPPER_RESTARTED",
+    6: "LOWER_RESTARTED",
+    7: "DRIVER_FAULT",
+    8: "UNDERVOLTAGE",
+    9: "INVALID_COMMAND",
+    10: "PHYSICAL_ESTOP",
 }
 
 ARM_TARGET_DISARMED = 1
@@ -370,6 +391,114 @@ def print_command_result(wire, expected_session_id, expected_command_id):
     print("COMMAND_RESULT valid: command ID, status, reason and CRC all match")
 
 
+def decode_safety_status(payload):
+    fields = {}
+    offset = 0
+    while offset < len(payload):
+        key, offset = decode_varint(payload, offset)
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if field_number == 0:
+            raise ValueError("SAFETY_STATUS has field number zero")
+
+        if wire_type == 0:
+            fields[field_number], offset = decode_varint(payload, offset)
+        elif wire_type == 5:
+            if offset + 4 > len(payload):
+                raise ValueError("truncated SAFETY_STATUS fixed32 field")
+            fields[field_number] = struct.unpack_from("<I", payload, offset)[0]
+            offset += 4
+        else:
+            raise ValueError("unsupported SAFETY_STATUS Protobuf wire type")
+
+    return {
+        "link_ready": bool(fields.get(1, 0)),
+        "armed": bool(fields.get(2, 0)),
+        "safety_state": fields.get(3, 0),
+        "stop_reason": fields.get(4, 0),
+        "fault_bits": fields.get(5, 0),
+        "motion_age_ms": fields.get(6, 0),
+        "battery_mv": fields.get(7, 0),
+        "watchdog_triggered": bool(fields.get(8, 0)),
+        "validity_flags": fields.get(9, 0),
+    }
+
+
+def print_safety_status(wire, expected_session_id):
+    reply = parse_wire_reply(wire)
+    if reply["msg_type"] != MSG_SAFETY_STATUS:
+        raise ValueError("reply is not SAFETY_STATUS")
+    if reply["schema_hash"] != SCHEMA_HASH:
+        raise ValueError("SAFETY_STATUS schema hash does not match")
+    if reply["session_id"] != expected_session_id:
+        raise ValueError("SAFETY_STATUS session ID does not match")
+
+    status = decode_safety_status(reply["payload"])
+    state_name = SAFETY_STATE_NAMES.get(
+        status["safety_state"], f"UNKNOWN({status['safety_state']})"
+    )
+    reason_name = SAFETY_STOP_REASON_NAMES.get(
+        status["stop_reason"], f"UNKNOWN({status['stop_reason']})"
+    )
+    print(
+        "SAFETY_STATUS  "
+        f"seq={reply['seq']} "
+        f"link_ready={int(status['link_ready'])} "
+        f"armed={int(status['armed'])} "
+        f"state={state_name} "
+        f"reason={reason_name} "
+        f"age_ms={status['motion_age_ms']} "
+        f"validity=0x{status['validity_flags']:08X}"
+    )
+    return status
+
+
+def read_next_wire_frame(stm32, buffered, deadline):
+    while time.monotonic() < deadline:
+        delimiter = buffered.find(0)
+        if delimiter >= 0:
+            wire = bytes(buffered[: delimiter + 1])
+            del buffered[: delimiter + 1]
+            if len(wire) > 1:
+                return wire
+            continue
+
+        chunk = stm32.read(256)
+        if chunk:
+            buffered.extend(chunk)
+    return b""
+
+
+def wait_for_reply(stm32, buffered, expected_msg_type, session_id, timeout_s):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        wire = read_next_wire_frame(stm32, buffered, deadline)
+        if not wire:
+            break
+        reply = parse_wire_reply(wire)
+        if reply["msg_type"] == MSG_SAFETY_STATUS:
+            print_safety_status(wire, session_id)
+            continue
+        if reply["msg_type"] == expected_msg_type:
+            return wire
+        print(f"ignored unexpected reply type 0x{reply['msg_type']:04X}")
+    return b""
+
+
+def listen_for_safety_status(stm32, buffered, session_id, duration_s):
+    deadline = time.monotonic() + duration_s
+    count = 0
+    while time.monotonic() < deadline:
+        wire = read_next_wire_frame(stm32, buffered, deadline)
+        if not wire:
+            break
+        reply = parse_wire_reply(wire)
+        if reply["msg_type"] == MSG_SAFETY_STATUS:
+            print_safety_status(wire, session_id)
+            count += 1
+    print(f"received {count} SAFETY_STATUS frame(s) in {duration_s:g} s")
+
+
 def self_check():
     if struct.calcsize("<2sBBHHIIIQHH") != HEADER_SIZE:
         raise RuntimeError("Draft header is not 32 bytes")
@@ -433,6 +562,12 @@ def main():
         "--timestamp-us", type=parse_int, default=DEFAULT_TIMESTAMP_US
     )
     parser.add_argument(
+        "--listen-s",
+        type=float,
+        default=0.0,
+        help="after the reply, print SAFETY_STATUS frames for this many seconds",
+    )
+    parser.add_argument(
         "--bad-crc",
         action="store_true",
         help="corrupt one CRC byte to test STM32 rejection",
@@ -441,6 +576,10 @@ def main():
 
     if args.duration_s < 0.0:
         parser.error("--duration-s must be non-negative")
+    if args.listen_s < 0.0:
+        parser.error("--listen-s must be non-negative")
+    if args.listen_s > 0.0 and args.send is None:
+        parser.error("--listen-s requires --send [PORT]")
     if args.duration_s > 0.0 and args.message != "chassis":
         parser.error("--duration-s is only supported for chassis messages")
     if args.duration_s > 0.0 and args.send is None:
@@ -531,6 +670,7 @@ def main():
         return
 
     reply_wire = b""
+    receive_buffer = bytearray()
     expects_reply = args.message in (
         "hello",
         "arm",
@@ -538,11 +678,29 @@ def main():
         "safe-stop",
     ) and not args.bad_crc
     reply_timeout = 1.0 if expects_reply else 0.2
-    with serial.Serial(port=port, baudrate=115200, timeout=reply_timeout) as stm32:
+    with serial.Serial(port=port, baudrate=115200, timeout=0.05) as stm32:
+        stm32.reset_input_buffer()
         written = stm32.write(wire)
         stm32.flush()
         if expects_reply:
-            reply_wire = stm32.read_until(b"\x00")
+            expected_type = (
+                MSG_HELLO_ACK if args.message == "hello" else MSG_COMMAND_RESULT
+            )
+            reply_wire = wait_for_reply(
+                stm32,
+                receive_buffer,
+                expected_type,
+                args.session_id,
+                reply_timeout,
+            )
+
+        if args.listen_s > 0.0:
+            listen_for_safety_status(
+                stm32,
+                receive_buffer,
+                args.session_id,
+                args.listen_s,
+            )
 
     print(f"sent {written} bytes to {port}")
     if args.bad_crc:
