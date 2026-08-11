@@ -821,6 +821,41 @@ def run_gripper_test(serial_module, port, args):
         stm32.write(wire)
         stm32.flush()
 
+    def wait_for_gripper_result(stm32, timeout_s):
+        nonlocal heartbeat_seq, target_seen
+        deadline = time.monotonic() + timeout_s
+        next_heartbeat = time.monotonic() + period_s
+
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_heartbeat:
+                send_frame(
+                    stm32,
+                    MSG_HEARTBEAT,
+                    build_heartbeat_payload(heartbeat_seq),
+                )
+                heartbeat_seq += 1
+                next_heartbeat += period_s
+
+            wire = read_next_wire_frame(
+                stm32, receive_buffer, min(deadline, next_heartbeat)
+            )
+            if not wire:
+                continue
+
+            reply = parse_wire_reply(wire)
+            if reply["msg_type"] == MSG_COMMAND_RESULT:
+                return wire
+            if reply["msg_type"] == MSG_HEARTBEAT_ACK:
+                print_heartbeat_ack(wire, args.session_id)
+            elif reply["msg_type"] == MSG_SAFETY_STATUS:
+                print_safety_status(wire, args.session_id)
+            elif reply["msg_type"] == MSG_ROBOT_STATE:
+                state = print_robot_state(wire, args.session_id)
+                if state["gripper_target_percent"] == expected_percent:
+                    target_seen = True
+        return b""
+
     print("Draft v0.1 GRIPPER TEST")
     print(f"schema hash    : 0x{SCHEMA_HASH:08X}")
     print(f"target         : {args.gripper_target.upper()}")
@@ -864,9 +899,7 @@ def run_gripper_test(serial_module, port, args):
             MSG_GRIPPER_COMMAND,
             build_gripper_payload(args.gripper_target, args.command_id + 1),
         )
-        wire = wait_for_reply(
-            stm32, receive_buffer, MSG_COMMAND_RESULT, args.session_id, 1.0
-        )
+        wire = wait_for_gripper_result(stm32, 1.0)
         if not wire:
             raise SystemExit("gripper test failed: no GRIPPER COMMAND_RESULT")
         status, _ = print_command_result(
