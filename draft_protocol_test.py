@@ -16,6 +16,7 @@ CRC_SIZE = 4
 MAX_DECODED_SIZE = 4096
 
 MSG_HELLO = 0x0001
+MSG_HELLO_ACK = 0x0002
 MSG_ARM_COMMAND = 0x0010
 MSG_CHASSIS_SETPOINT = 0x0011
 MSG_SAFE_STOP = 0x0013
@@ -210,6 +211,85 @@ def hex_bytes(data):
     return " ".join(f"{value:02X}" for value in data)
 
 
+def parse_wire_reply(wire):
+    """Validate and describe one zero-delimited Draft v0.1 reply frame."""
+    if not wire or wire[-1] != 0:
+        raise ValueError("reply is missing the 0x00 frame delimiter")
+
+    decoded = cobs_decode(wire[:-1])
+    if len(decoded) < HEADER_SIZE + CRC_SIZE:
+        raise ValueError("reply is shorter than the fixed header and CRC")
+
+    (
+        magic,
+        version,
+        flags,
+        msg_type,
+        header_size,
+        schema_hash,
+        session_id,
+        seq,
+        source_timestamp_us,
+        payload_length,
+        reserved,
+    ) = struct.unpack_from("<2sBBHHIIIQHH", decoded, 0)
+
+    expected_length = HEADER_SIZE + payload_length + CRC_SIZE
+    if len(decoded) != expected_length:
+        raise ValueError(
+            f"reply length mismatch: got {len(decoded)}, expected {expected_length}"
+        )
+    if magic != MAGIC:
+        raise ValueError(f"bad reply magic: {magic!r}")
+    if version != PROTOCOL_VERSION:
+        raise ValueError(f"unsupported reply version: {version}")
+    if header_size != HEADER_SIZE:
+        raise ValueError(f"bad reply header size: {header_size}")
+
+    stored_crc = struct.unpack_from("<I", decoded, len(decoded) - CRC_SIZE)[0]
+    calculated_crc = crc32c(decoded[:-CRC_SIZE])
+    if stored_crc != calculated_crc:
+        raise ValueError(
+            f"bad reply CRC32C: stored 0x{stored_crc:08X}, "
+            f"calculated 0x{calculated_crc:08X}"
+        )
+
+    return {
+        "decoded": decoded,
+        "flags": flags,
+        "msg_type": msg_type,
+        "schema_hash": schema_hash,
+        "session_id": session_id,
+        "seq": seq,
+        "source_timestamp_us": source_timestamp_us,
+        "payload": decoded[HEADER_SIZE:-CRC_SIZE],
+        "reserved": reserved,
+        "stored_crc": stored_crc,
+    }
+
+
+def print_hello_ack(wire, expected_session_id):
+    reply = parse_wire_reply(wire)
+    print("reply received")
+    print(f"reply wire     : {hex_bytes(wire)}")
+    print(f"reply decoded  : {hex_bytes(reply['decoded'])}")
+    print(f"reply msg type : 0x{reply['msg_type']:04X}")
+    print(f"reply schema   : 0x{reply['schema_hash']:08X}")
+    print(f"reply session  : 0x{reply['session_id']:08X}")
+    print(f"reply seq      : {reply['seq']}")
+    print(f"reply CRC32C   : 0x{reply['stored_crc']:08X}")
+
+    if reply["msg_type"] != MSG_HELLO_ACK:
+        raise ValueError("reply is not HELLO_ACK")
+    if reply["schema_hash"] != SCHEMA_HASH:
+        raise ValueError("HELLO_ACK schema hash does not match")
+    if reply["session_id"] != expected_session_id:
+        raise ValueError("HELLO_ACK session ID does not match")
+    if reply["payload"]:
+        raise ValueError("minimal HELLO_ACK payload should be empty")
+    print("HELLO_ACK valid: protocol, schema, session and CRC all match")
+
+
 def self_check():
     if struct.calcsize("<2sBBHHIIIQHH") != HEADER_SIZE:
         raise RuntimeError("Draft header is not 32 bytes")
@@ -370,15 +450,24 @@ def main():
         )
         return
 
-    with serial.Serial(port=port, baudrate=115200, timeout=0.2) as stm32:
+    reply_wire = b""
+    reply_timeout = 1.0 if args.message == "hello" and not args.bad_crc else 0.2
+    with serial.Serial(port=port, baudrate=115200, timeout=reply_timeout) as stm32:
         written = stm32.write(wire)
         stm32.flush()
+        if args.message == "hello" and not args.bad_crc:
+            reply_wire = stm32.read_until(b"\x00")
 
     print(f"sent {written} bytes to {port}")
     if args.bad_crc:
         print("expected STM32 result: crc_errors increases by 1")
     elif args.message == "hello":
-        print("expected STM32 result: hello_accepted increases by 1")
+        if not reply_wire:
+            raise SystemExit("no HELLO_ACK received within 1.0 s")
+        try:
+            print_hello_ack(reply_wire, args.session_id)
+        except ValueError as exc:
+            raise SystemExit(f"invalid HELLO_ACK: {exc}") from exc
     elif args.message == "chassis" and (
         args.linear_mm_s != 0 or args.angular_mrad_s != 0
     ):
