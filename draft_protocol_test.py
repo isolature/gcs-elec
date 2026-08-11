@@ -10,7 +10,7 @@ import time
 
 MAGIC = b"RC"
 PROTOCOL_VERSION = 1
-SCHEMA_HASH = 0x53D3AA6F
+SCHEMA_HASH = 0x59C88A67
 HEADER_SIZE = 32
 CRC_SIZE = 4
 MAX_DECODED_SIZE = 4096
@@ -20,6 +20,19 @@ MSG_HELLO_ACK = 0x0002
 MSG_ARM_COMMAND = 0x0010
 MSG_CHASSIS_SETPOINT = 0x0011
 MSG_SAFE_STOP = 0x0013
+MSG_COMMAND_RESULT = 0x0080
+
+COMMAND_RESULT_STATUS_ACCEPTED = 1
+COMMAND_RESULT_STATUS_REJECTED = 2
+
+COMMAND_RESULT_REASON_NAMES = {
+    1: "NONE",
+    2: "NOT_READY",
+    3: "NOT_ARMED",
+    4: "FAULT",
+    5: "NOT_CONFIGURED",
+    6: "INVALID_ARGUMENT",
+}
 
 ARM_TARGET_DISARMED = 1
 ARM_TARGET_ARMED = 2
@@ -102,6 +115,19 @@ def encode_varint(value):
         value >>= 7
     output.append(value)
     return bytes(output)
+
+
+def decode_varint(data, offset):
+    value = 0
+    for shift in range(0, 64, 7):
+        if offset >= len(data):
+            raise ValueError("truncated Protobuf varint")
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, offset
+    raise ValueError("Protobuf varint is too long")
 
 
 def encode_sint32(value):
@@ -290,6 +316,60 @@ def print_hello_ack(wire, expected_session_id):
     print("HELLO_ACK valid: protocol, schema, session and CRC all match")
 
 
+def print_command_result(wire, expected_session_id, expected_command_id):
+    reply = parse_wire_reply(wire)
+    print("reply received")
+    print(f"reply wire     : {hex_bytes(wire)}")
+    print(f"reply decoded  : {hex_bytes(reply['decoded'])}")
+    print(f"reply msg type : 0x{reply['msg_type']:04X}")
+    print(f"reply schema   : 0x{reply['schema_hash']:08X}")
+    print(f"reply session  : 0x{reply['session_id']:08X}")
+    print(f"reply seq      : {reply['seq']}")
+    print(f"reply CRC32C   : 0x{reply['stored_crc']:08X}")
+
+    if reply["msg_type"] != MSG_COMMAND_RESULT:
+        raise ValueError("reply is not COMMAND_RESULT")
+    if reply["schema_hash"] != SCHEMA_HASH:
+        raise ValueError("COMMAND_RESULT schema hash does not match")
+    if reply["session_id"] != expected_session_id:
+        raise ValueError("COMMAND_RESULT session ID does not match")
+
+    fields = {}
+    offset = 0
+    payload = reply["payload"]
+    while offset < len(payload):
+        key, offset = decode_varint(payload, offset)
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if field_number == 0 or wire_type != 0:
+            raise ValueError("unsupported COMMAND_RESULT Protobuf field")
+        fields[field_number], offset = decode_varint(payload, offset)
+
+    command_id = fields.get(1, 0)
+    status = fields.get(2, 0)
+    reason = fields.get(3, 0)
+    status_name = {
+        COMMAND_RESULT_STATUS_ACCEPTED: "ACCEPTED",
+        COMMAND_RESULT_STATUS_REJECTED: "REJECTED",
+        3: "COMPLETED",
+    }.get(status, f"UNKNOWN({status})")
+    reason_name = COMMAND_RESULT_REASON_NAMES.get(reason, f"UNKNOWN({reason})")
+    print(f"command id     : {command_id}")
+    print(f"command status : {status_name}")
+    print(f"command reason : {reason_name}")
+
+    if command_id != expected_command_id:
+        raise ValueError("COMMAND_RESULT command_id does not match")
+    if status not in (
+        COMMAND_RESULT_STATUS_ACCEPTED,
+        COMMAND_RESULT_STATUS_REJECTED,
+    ):
+        raise ValueError("COMMAND_RESULT status is invalid")
+    if reason not in COMMAND_RESULT_REASON_NAMES:
+        raise ValueError("COMMAND_RESULT reason is invalid")
+    print("COMMAND_RESULT valid: command ID, status, reason and CRC all match")
+
+
 def self_check():
     if struct.calcsize("<2sBBHHIIIQHH") != HEADER_SIZE:
         raise RuntimeError("Draft header is not 32 bytes")
@@ -451,11 +531,17 @@ def main():
         return
 
     reply_wire = b""
-    reply_timeout = 1.0 if args.message == "hello" and not args.bad_crc else 0.2
+    expects_reply = args.message in (
+        "hello",
+        "arm",
+        "disarm",
+        "safe-stop",
+    ) and not args.bad_crc
+    reply_timeout = 1.0 if expects_reply else 0.2
     with serial.Serial(port=port, baudrate=115200, timeout=reply_timeout) as stm32:
         written = stm32.write(wire)
         stm32.flush()
-        if args.message == "hello" and not args.bad_crc:
+        if expects_reply:
             reply_wire = stm32.read_until(b"\x00")
 
     print(f"sent {written} bytes to {port}")
@@ -468,6 +554,17 @@ def main():
             print_hello_ack(reply_wire, args.session_id)
         except ValueError as exc:
             raise SystemExit(f"invalid HELLO_ACK: {exc}") from exc
+    elif args.message in ("arm", "disarm", "safe-stop"):
+        if not reply_wire:
+            raise SystemExit("no COMMAND_RESULT received within 1.0 s")
+        try:
+            print_command_result(
+                reply_wire,
+                args.session_id,
+                args.command_id,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"invalid COMMAND_RESULT: {exc}") from exc
     elif args.message == "chassis" and (
         args.linear_mm_s != 0 or args.angular_mrad_s != 0
     ):
