@@ -9,13 +9,14 @@ import struct
 
 MAGIC = b"RC"
 PROTOCOL_VERSION = 1
-SCHEMA_HASH = 0x89A1FF05
+SCHEMA_HASH = 0x53D3AA6F
 HEADER_SIZE = 32
 CRC_SIZE = 4
 MAX_DECODED_SIZE = 4096
 
 MSG_HELLO = 0x0001
 MSG_ARM_COMMAND = 0x0010
+MSG_CHASSIS_SETPOINT = 0x0011
 MSG_SAFE_STOP = 0x0013
 
 ARM_TARGET_DISARMED = 1
@@ -101,11 +102,34 @@ def encode_varint(value):
     return bytes(output)
 
 
-def build_command_payload(message_name, command_id):
+def encode_sint32(value):
+    if not -(1 << 31) <= value < (1 << 31):
+        raise ValueError("sint32 value is out of range")
+    return encode_varint(((value << 1) ^ (value >> 31)) & 0xFFFFFFFF)
+
+
+def build_command_payload(
+    message_name,
+    command_id,
+    linear_velocity_mm_s,
+    angular_velocity_mrad_s,
+    ttl_ms,
+):
     """Build the small Draft v0.1 Protobuf payloads without a runtime dependency."""
     if message_name == "hello":
         # Proto3 omits both zero-valued Hello fields, so the payload is empty.
         return MSG_HELLO, b""
+
+    if message_name == "chassis":
+        if not 1 <= ttl_ms <= 1000:
+            raise ValueError("ttl_ms must be in 1..1000")
+        payload = bytearray()
+        if linear_velocity_mm_s != 0:
+            payload += b"\x08" + encode_sint32(linear_velocity_mm_s)
+        if angular_velocity_mrad_s != 0:
+            payload += b"\x10" + encode_sint32(angular_velocity_mrad_s)
+        payload += b"\x18" + encode_varint(ttl_ms)
+        return MSG_CHASSIS_SETPOINT, bytes(payload)
 
     if message_name == "arm":
         target = ARM_TARGET_ARMED
@@ -210,12 +234,12 @@ def self_check():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build Draft v0.1 HELLO/ARM/DISARM/SAFE_STOP test frames."
+        description="Build Draft v0.1 RescueCar protocol test frames."
     )
     parser.add_argument(
         "message",
         nargs="?",
-        choices=("hello", "arm", "disarm", "safe-stop"),
+        choices=("hello", "arm", "disarm", "chassis", "safe-stop"),
         default="hello",
         help="message to build; default: hello",
     )
@@ -229,6 +253,9 @@ def main():
     parser.add_argument("--session-id", type=parse_int, default=DEFAULT_SESSION_ID)
     parser.add_argument("--seq", type=parse_int, default=DEFAULT_SEQ)
     parser.add_argument("--command-id", type=parse_int, default=1)
+    parser.add_argument("--linear-mm-s", type=int, default=0)
+    parser.add_argument("--angular-mrad-s", type=int, default=0)
+    parser.add_argument("--ttl-ms", type=int, default=200)
     parser.add_argument(
         "--timestamp-us", type=parse_int, default=DEFAULT_TIMESTAMP_US
     )
@@ -240,7 +267,13 @@ def main():
     args = parser.parse_args()
 
     self_check()
-    msg_type, payload = build_command_payload(args.message, args.command_id)
+    msg_type, payload = build_command_payload(
+        args.message,
+        args.command_id,
+        args.linear_mm_s,
+        args.angular_mrad_s,
+        args.ttl_ms,
+    )
     decoded, wire = build_wire_frame(
         payload=payload,
         msg_type=msg_type,
@@ -284,6 +317,10 @@ def main():
         print("expected STM32 result: crc_errors increases by 1")
     elif args.message == "hello":
         print("expected STM32 result: hello_accepted increases by 1")
+    elif args.message == "chassis" and (
+        args.linear_mm_s != 0 or args.angular_mrad_s != 0
+    ):
+        print("expected before geometry setup: commands_rejected increases by 1")
     else:
         print("expected STM32 result: commands_dispatched increases by 1")
 
