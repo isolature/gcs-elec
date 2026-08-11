@@ -10,7 +10,7 @@ import time
 
 MAGIC = b"RC"
 PROTOCOL_VERSION = 1
-SCHEMA_HASH = 0x7ECBC8FD
+SCHEMA_HASH = 0x7671E0E1
 HEADER_SIZE = 32
 CRC_SIZE = 4
 MAX_DECODED_SIZE = 4096
@@ -20,9 +20,11 @@ MSG_HELLO_ACK = 0x0002
 MSG_ARM_COMMAND = 0x0010
 MSG_CHASSIS_SETPOINT = 0x0011
 MSG_SAFE_STOP = 0x0013
+MSG_HEARTBEAT = 0x0014
 MSG_COMMAND_RESULT = 0x0080
 MSG_ROBOT_STATE = 0x0081
 MSG_SAFETY_STATUS = 0x0082
+MSG_HEARTBEAT_ACK = 0x0083
 
 COMMAND_RESULT_STATUS_ACCEPTED = 1
 COMMAND_RESULT_STATUS_REJECTED = 2
@@ -68,6 +70,7 @@ GRIPPER_STATE_NAMES = {
 ARM_TARGET_DISARMED = 1
 ARM_TARGET_ARMED = 2
 SAFE_STOP_REASON_USER_REQUEST = 1
+UPPER_CONTROL_STATE_ACTIVE = 3
 
 DEFAULT_SESSION_ID = 0x12345678
 DEFAULT_SEQ = 1
@@ -406,6 +409,58 @@ def print_command_result(wire, expected_session_id, expected_command_id):
     print("COMMAND_RESULT valid: command ID, status, reason and CRC all match")
 
 
+def build_heartbeat_payload(heartbeat_seq):
+    if not 1 <= heartbeat_seq <= 0xFFFFFFFF:
+        raise ValueError("heartbeat_seq must be in 1..0xFFFFFFFF")
+    return (
+        b"\x08"
+        + encode_varint(heartbeat_seq)
+        + b"\x10"
+        + encode_varint(UPPER_CONTROL_STATE_ACTIVE)
+    )
+
+
+def decode_heartbeat_ack(payload):
+    fields = {}
+    offset = 0
+    while offset < len(payload):
+        key, offset = decode_varint(payload, offset)
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if field_number == 1 and wire_type == 0:
+            fields[1], offset = decode_varint(payload, offset)
+        elif field_number == 2 and wire_type == 1:
+            if offset + 8 > len(payload):
+                raise ValueError("truncated HEARTBEAT_ACK timestamp")
+            fields[2] = struct.unpack_from("<Q", payload, offset)[0]
+            offset += 8
+        else:
+            raise ValueError("unsupported HEARTBEAT_ACK Protobuf field")
+
+    heartbeat_seq = fields.get(1, 0)
+    if heartbeat_seq == 0 or 2 not in fields:
+        raise ValueError("HEARTBEAT_ACK is missing a required field")
+    return heartbeat_seq, fields[2]
+
+
+def print_heartbeat_ack(wire, expected_session_id):
+    reply = parse_wire_reply(wire)
+    if reply["msg_type"] != MSG_HEARTBEAT_ACK:
+        raise ValueError("reply is not HEARTBEAT_ACK")
+    if reply["schema_hash"] != SCHEMA_HASH:
+        raise ValueError("HEARTBEAT_ACK schema hash does not match")
+    if reply["session_id"] != expected_session_id:
+        raise ValueError("HEARTBEAT_ACK session ID does not match")
+
+    heartbeat_seq, lower_timestamp_us = decode_heartbeat_ack(reply["payload"])
+    print(
+        "HEARTBEAT_ACK "
+        f"reply_seq={reply['seq']} heartbeat_seq={heartbeat_seq} "
+        f"lower_t_us={lower_timestamp_us}"
+    )
+    return heartbeat_seq
+
+
 def decode_safety_status(payload):
     fields = {}
     offset = 0
@@ -603,6 +658,131 @@ def listen_for_telemetry(stm32, buffered, session_id, duration_s):
     )
 
 
+def run_watchdog_test(serial_module, port, args):
+    """Establish a session, feed the watchdog, then prove loss is detected."""
+    receive_buffer = bytearray()
+    frame_seq = args.seq
+    heartbeat_seq = 1
+    heartbeat_acks = 0
+    duration_s = args.duration_s if args.duration_s > 0.0 else 2.0
+    period_s = 1.0 / args.rate_hz
+    final_status = None
+
+    def send_frame(stm32, msg_type, payload):
+        nonlocal frame_seq
+        _, wire = build_wire_frame(
+            payload=payload,
+            msg_type=msg_type,
+            session_id=args.session_id,
+            seq=frame_seq,
+            source_timestamp_us=args.timestamp_us,
+        )
+        frame_seq = (frame_seq + 1) & 0xFFFFFFFF
+        stm32.write(wire)
+        stm32.flush()
+
+    print("Draft v0.1 HEARTBEAT WATCHDOG TEST")
+    print(f"schema hash    : 0x{SCHEMA_HASH:08X}")
+    print(f"heartbeat rate : {args.rate_hz:g} Hz")
+    print(f"feed duration  : {duration_s:g} s")
+    print("loss timeout   : 300 ms")
+
+    with serial_module.Serial(port=port, baudrate=115200, timeout=0.02) as stm32:
+        stm32.reset_input_buffer()
+
+        send_frame(stm32, MSG_HELLO, b"")
+        wire = wait_for_reply(
+            stm32, receive_buffer, MSG_HELLO_ACK, args.session_id, 1.0
+        )
+        if not wire:
+            raise SystemExit("watchdog test failed: no HELLO_ACK")
+        print_hello_ack(wire, args.session_id)
+
+        _, arm_payload = build_command_payload(
+            "arm", args.command_id, 0, 0, args.ttl_ms
+        )
+        send_frame(stm32, MSG_ARM_COMMAND, arm_payload)
+        wire = wait_for_reply(
+            stm32, receive_buffer, MSG_COMMAND_RESULT, args.session_id, 1.0
+        )
+        if not wire:
+            raise SystemExit("watchdog test failed: no ARM COMMAND_RESULT")
+        print_command_result(wire, args.session_id, args.command_id)
+
+        start_time = time.monotonic()
+        stop_time = start_time + duration_s
+        next_send_time = start_time
+        while next_send_time < stop_time:
+            delay_s = next_send_time - time.monotonic()
+            if delay_s > 0.0:
+                time.sleep(delay_s)
+
+            send_frame(
+                stm32,
+                MSG_HEARTBEAT,
+                build_heartbeat_payload(heartbeat_seq),
+            )
+            heartbeat_seq += 1
+
+            # If a motion target was requested, refresh it beside the heartbeat.
+            if args.linear_mm_s != 0 or args.angular_mrad_s != 0:
+                _, chassis_payload = build_command_payload(
+                    "chassis",
+                    args.command_id,
+                    args.linear_mm_s,
+                    args.angular_mrad_s,
+                    args.ttl_ms,
+                )
+                send_frame(stm32, MSG_CHASSIS_SETPOINT, chassis_payload)
+
+            next_send_time += period_s
+            read_deadline = min(next_send_time, stop_time)
+            while time.monotonic() < read_deadline:
+                wire = read_next_wire_frame(stm32, receive_buffer, read_deadline)
+                if not wire:
+                    break
+                reply = parse_wire_reply(wire)
+                if reply["msg_type"] == MSG_HEARTBEAT_ACK:
+                    print_heartbeat_ack(wire, args.session_id)
+                    heartbeat_acks += 1
+                elif reply["msg_type"] == MSG_SAFETY_STATUS:
+                    print_safety_status(wire, args.session_id)
+                elif reply["msg_type"] == MSG_ROBOT_STATE:
+                    print_robot_state(wire, args.session_id)
+
+        print("heartbeat transmission stopped; waiting for HEARTBEAT_LOST...")
+        loss_deadline = time.monotonic() + 0.8
+        while time.monotonic() < loss_deadline:
+            wire = read_next_wire_frame(stm32, receive_buffer, loss_deadline)
+            if not wire:
+                break
+            reply = parse_wire_reply(wire)
+            if reply["msg_type"] == MSG_HEARTBEAT_ACK:
+                print_heartbeat_ack(wire, args.session_id)
+                heartbeat_acks += 1
+            elif reply["msg_type"] == MSG_SAFETY_STATUS:
+                status = print_safety_status(wire, args.session_id)
+                if (
+                    status["safety_state"] == 3
+                    and status["stop_reason"] == 4
+                    and status["watchdog_triggered"]
+                ):
+                    final_status = status
+                    break
+            elif reply["msg_type"] == MSG_ROBOT_STATE:
+                print_robot_state(wire, args.session_id)
+
+    print(f"received {heartbeat_acks} HEARTBEAT_ACK frame(s)")
+    if final_status is None:
+        raise SystemExit(
+            "watchdog test failed: no SAFE_STOP / HEARTBEAT_LOST status received"
+        )
+    print(
+        "WATCHDOG TEST PASSED: heartbeat loss caused SAFE_STOP, "
+        "HEARTBEAT_LOST and watchdog_triggered=1"
+    )
+
+
 def self_check():
     if struct.calcsize("<2sBBHHIIIQHH") != HEADER_SIZE:
         raise RuntimeError("Draft header is not 32 bytes")
@@ -633,7 +813,14 @@ def main():
     parser.add_argument(
         "message",
         nargs="?",
-        choices=("hello", "arm", "disarm", "chassis", "safe-stop"),
+        choices=(
+            "hello",
+            "arm",
+            "disarm",
+            "chassis",
+            "safe-stop",
+            "watchdog-test",
+        ),
         default="hello",
         help="message to build; default: hello",
     )
@@ -654,7 +841,10 @@ def main():
         "--duration-s",
         type=float,
         default=0.0,
-        help="repeat a chassis command for this many seconds; default: send once",
+        help=(
+            "repeat a chassis command, or feed watchdog-test heartbeats, "
+            "for this many seconds"
+        ),
     )
     parser.add_argument(
         "--rate-hz",
@@ -684,18 +874,41 @@ def main():
         parser.error("--listen-s must be non-negative")
     if args.listen_s > 0.0 and args.send is None:
         parser.error("--listen-s requires --send [PORT]")
-    if args.duration_s > 0.0 and args.message != "chassis":
-        parser.error("--duration-s is only supported for chassis messages")
+    if args.duration_s > 0.0 and args.message not in (
+        "chassis",
+        "watchdog-test",
+    ):
+        parser.error(
+            "--duration-s is only supported for chassis and watchdog-test"
+        )
     if args.duration_s > 0.0 and args.send is None:
         parser.error("--duration-s requires --send [PORT]")
+    if args.message == "watchdog-test" and args.send is None:
+        parser.error("watchdog-test requires --send [PORT]")
     if not 1.0 <= args.rate_hz <= 100.0:
         parser.error("--rate-hz must be in 1..100")
     if args.duration_s > 0.0 and args.bad_crc:
         parser.error("--bad-crc cannot be combined with --duration-s")
+    if args.message == "watchdog-test" and args.bad_crc:
+        parser.error("--bad-crc cannot be combined with watchdog-test")
     if args.duration_s > 0.0 and args.ttl_ms <= (1000.0 / args.rate_hz):
         parser.error("--ttl-ms must be longer than one repeat interval")
+    if args.message == "watchdog-test" and (1000.0 / args.rate_hz) >= 300.0:
+        parser.error("watchdog-test heartbeat interval must be below 300 ms")
 
     self_check()
+    if args.message == "watchdog-test":
+        try:
+            import serial
+        except ImportError as exc:
+            raise SystemExit(
+                "pyserial is required for --send: pip install pyserial"
+            ) from exc
+
+        port = find_stm32() if args.send == "auto" else args.send
+        run_watchdog_test(serial, port, args)
+        return
+
     msg_type, payload = build_command_payload(
         args.message,
         args.command_id,
