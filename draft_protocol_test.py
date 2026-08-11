@@ -9,11 +9,18 @@ import struct
 
 MAGIC = b"RC"
 PROTOCOL_VERSION = 1
+SCHEMA_HASH = 0x89A1FF05
 HEADER_SIZE = 32
 CRC_SIZE = 4
 MAX_DECODED_SIZE = 4096
 
 MSG_HELLO = 0x0001
+MSG_ARM_COMMAND = 0x0010
+MSG_SAFE_STOP = 0x0013
+
+ARM_TARGET_DISARMED = 1
+ARM_TARGET_ARMED = 2
+SAFE_STOP_REASON_USER_REQUEST = 1
 
 DEFAULT_SESSION_ID = 0x12345678
 DEFAULT_SEQ = 1
@@ -82,12 +89,48 @@ def cobs_decode(data):
     return bytes(output)
 
 
+def encode_varint(value):
+    if not 0 <= value <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("varint value is out of range")
+
+    output = bytearray()
+    while value > 0x7F:
+        output.append((value & 0x7F) | 0x80)
+        value >>= 7
+    output.append(value)
+    return bytes(output)
+
+
+def build_command_payload(message_name, command_id):
+    """Build the small Draft v0.1 Protobuf payloads without a runtime dependency."""
+    if message_name == "hello":
+        # Proto3 omits both zero-valued Hello fields, so the payload is empty.
+        return MSG_HELLO, b""
+
+    if message_name == "arm":
+        target = ARM_TARGET_ARMED
+        msg_type = MSG_ARM_COMMAND
+    elif message_name == "disarm":
+        target = ARM_TARGET_DISARMED
+        msg_type = MSG_ARM_COMMAND
+    elif message_name == "safe-stop":
+        target = SAFE_STOP_REASON_USER_REQUEST
+        msg_type = MSG_SAFE_STOP
+    else:
+        raise ValueError(f"unsupported test message: {message_name}")
+
+    # Field 1: enum (wire type 0). Field 2: command_id (wire type 0).
+    payload = b"\x08" + encode_varint(target)
+    payload += b"\x10" + encode_varint(command_id)
+    return msg_type, payload
+
+
 def build_decoded_frame(
     payload=b"",
     *,
     msg_type=MSG_HELLO,
     flags=0,
-    schema_hash=0,
+    schema_hash=SCHEMA_HASH,
     session_id=DEFAULT_SESSION_ID,
     seq=DEFAULT_SEQ,
     source_timestamp_us=DEFAULT_TIMESTAMP_US,
@@ -167,7 +210,14 @@ def self_check():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build a Draft v0.1 empty-payload HELLO test frame."
+        description="Build Draft v0.1 HELLO/ARM/DISARM/SAFE_STOP test frames."
+    )
+    parser.add_argument(
+        "message",
+        nargs="?",
+        choices=("hello", "arm", "disarm", "safe-stop"),
+        default="hello",
+        help="message to build; default: hello",
     )
     parser.add_argument(
         "--send",
@@ -178,6 +228,7 @@ def main():
     )
     parser.add_argument("--session-id", type=parse_int, default=DEFAULT_SESSION_ID)
     parser.add_argument("--seq", type=parse_int, default=DEFAULT_SEQ)
+    parser.add_argument("--command-id", type=parse_int, default=1)
     parser.add_argument(
         "--timestamp-us", type=parse_int, default=DEFAULT_TIMESTAMP_US
     )
@@ -189,7 +240,10 @@ def main():
     args = parser.parse_args()
 
     self_check()
+    msg_type, payload = build_command_payload(args.message, args.command_id)
     decoded, wire = build_wire_frame(
+        payload=payload,
+        msg_type=msg_type,
         session_id=args.session_id,
         seq=args.seq,
         source_timestamp_us=args.timestamp_us,
@@ -202,7 +256,9 @@ def main():
         wire = cobs_encode(decoded) + b"\x00"
 
     stored_crc = struct.unpack_from("<I", decoded, len(decoded) - CRC_SIZE)[0]
-    print("Draft v0.1 HELLO, empty payload")
+    print(f"Draft v0.1 {args.message.upper()}")
+    print(f"schema hash    : 0x{SCHEMA_HASH:08X}")
+    print(f"payload        : {hex_bytes(payload) if payload else '(empty)'}")
     print(f"decoded length : {len(decoded)} bytes")
     print(f"stored CRC32C  : 0x{stored_crc:08X}")
     print(f"decoded frame  : {hex_bytes(decoded)}")
@@ -226,8 +282,10 @@ def main():
     print(f"sent {written} bytes to {port}")
     if args.bad_crc:
         print("expected STM32 result: crc_errors increases by 1")
+    elif args.message == "hello":
+        print("expected STM32 result: hello_accepted increases by 1")
     else:
-        print("expected STM32 result: valid_frames increases by 1")
+        print("expected STM32 result: commands_dispatched increases by 1")
 
 
 if __name__ == "__main__":
