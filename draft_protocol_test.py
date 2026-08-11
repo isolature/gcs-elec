@@ -5,6 +5,7 @@ import argparse
 import glob
 import os
 import struct
+import time
 
 
 MAGIC = b"RC"
@@ -257,6 +258,18 @@ def main():
     parser.add_argument("--angular-mrad-s", type=int, default=0)
     parser.add_argument("--ttl-ms", type=int, default=200)
     parser.add_argument(
+        "--duration-s",
+        type=float,
+        default=0.0,
+        help="repeat a chassis command for this many seconds; default: send once",
+    )
+    parser.add_argument(
+        "--rate-hz",
+        type=float,
+        default=10.0,
+        help="repeat rate used with --duration-s; default: 10 Hz",
+    )
+    parser.add_argument(
         "--timestamp-us", type=parse_int, default=DEFAULT_TIMESTAMP_US
     )
     parser.add_argument(
@@ -265,6 +278,19 @@ def main():
         help="corrupt one CRC byte to test STM32 rejection",
     )
     args = parser.parse_args()
+
+    if args.duration_s < 0.0:
+        parser.error("--duration-s must be non-negative")
+    if args.duration_s > 0.0 and args.message != "chassis":
+        parser.error("--duration-s is only supported for chassis messages")
+    if args.duration_s > 0.0 and args.send is None:
+        parser.error("--duration-s requires --send [PORT]")
+    if not 1.0 <= args.rate_hz <= 100.0:
+        parser.error("--rate-hz must be in 1..100")
+    if args.duration_s > 0.0 and args.bad_crc:
+        parser.error("--bad-crc cannot be combined with --duration-s")
+    if args.duration_s > 0.0 and args.ttl_ms <= (1000.0 / args.rate_hz):
+        parser.error("--ttl-ms must be longer than one repeat interval")
 
     self_check()
     msg_type, payload = build_command_payload(
@@ -308,6 +334,42 @@ def main():
         raise SystemExit("pyserial is required for --send: pip install pyserial") from exc
 
     port = find_stm32() if args.send == "auto" else args.send
+    if args.duration_s > 0.0:
+        period_s = 1.0 / args.rate_hz
+        start_time = time.monotonic()
+        stop_time = start_time + args.duration_s
+        next_send_time = start_time
+        sent_frames = 0
+        written = 0
+
+        with serial.Serial(port=port, baudrate=115200, timeout=0.2) as stm32:
+            while next_send_time < stop_time:
+                delay_s = next_send_time - time.monotonic()
+                if delay_s > 0.0:
+                    time.sleep(delay_s)
+
+                _, repeated_wire = build_wire_frame(
+                    payload=payload,
+                    msg_type=msg_type,
+                    session_id=args.session_id,
+                    seq=(args.seq + sent_frames) & 0xFFFFFFFF,
+                    source_timestamp_us=args.timestamp_us,
+                )
+                written += stm32.write(repeated_wire)
+                sent_frames += 1
+                next_send_time = start_time + sent_frames * period_s
+            stm32.flush()
+
+        print(
+            f"sent {sent_frames} frames ({written} bytes) to {port} "
+            f"at {args.rate_hz:g} Hz for {args.duration_s:g} s"
+        )
+        print(
+            f"expected STM32 result: motion continues during the stream, "
+            f"then stops within {args.ttl_ms} ms"
+        )
+        return
+
     with serial.Serial(port=port, baudrate=115200, timeout=0.2) as stm32:
         written = stm32.write(wire)
         stm32.flush()
@@ -320,7 +382,7 @@ def main():
     elif args.message == "chassis" and (
         args.linear_mm_s != 0 or args.angular_mrad_s != 0
     ):
-        print("expected before geometry setup: commands_rejected increases by 1")
+        print("expected STM32 result: commands_dispatched increases by 1")
     else:
         print("expected STM32 result: commands_dispatched increases by 1")
 
