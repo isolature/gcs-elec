@@ -14,6 +14,7 @@ SCHEMA_HASH = 0x0B0ECAF4
 HEADER_SIZE = 32
 CRC_SIZE = 4
 MAX_DECODED_SIZE = 4096
+MAX_ENCODED_SIZE = MAX_DECODED_SIZE + (MAX_DECODED_SIZE // 254) + 1
 
 MSG_HELLO = 0x0001
 MSG_HELLO_ACK = 0x0002
@@ -758,6 +759,109 @@ def listen_for_telemetry(stm32, buffered, session_id, duration_s):
     )
 
 
+def run_boundary_test(serial_module, port, args):
+    """Exercise stream framing limits and prove recovery with HELLO_ACK."""
+    receive_buffer = bytearray()
+
+    def hello_wire(session_id, seq, payload=b""):
+        return build_wire_frame(
+            payload=payload,
+            msg_type=MSG_HELLO,
+            session_id=session_id,
+            seq=seq,
+            source_timestamp_us=args.timestamp_us,
+        )[1]
+
+    def await_compatible_hello(stm32, session_id, timeout_s=1.0):
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            reply_wire = read_next_wire_frame(stm32, receive_buffer, deadline)
+            if not reply_wire:
+                break
+            reply = parse_wire_reply(reply_wire)
+            if reply["msg_type"] != MSG_HELLO_ACK:
+                continue
+            if reply["session_id"] != session_id:
+                continue
+            validate_hello_ack(reply, session_id)
+            return
+        raise RuntimeError(f"no HELLO_ACK for session 0x{session_id:08X}")
+
+    def drain_for_reply_type(stm32, msg_type, timeout_s):
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            wire = read_next_wire_frame(stm32, receive_buffer, deadline)
+            if not wire:
+                break
+            if parse_wire_reply(wire)["msg_type"] == msg_type:
+                return True
+        return False
+
+    base_session = args.session_id & 0xFFFFFFFF
+    fragment_session = base_session
+    sticky_session = (base_session + 1) & 0xFFFFFFFF or 1
+    oversized_session = (base_session + 2) & 0xFFFFFFFF or 1
+    unknown_session = (base_session + 3) & 0xFFFFFFFF or 1
+
+    print("Draft v0.1 PROTOCOL BOUNDARY TEST")
+    print(f"schema hash    : 0x{SCHEMA_HASH:08X}")
+    print(f"serial port    : {port}")
+
+    with serial_module.Serial(
+        port=port, baudrate=115200, timeout=0.02
+    ) as stm32:
+        stm32.reset_input_buffer()
+
+        fragmented = hello_wire(fragment_session, args.seq)
+        split_at = max(1, len(fragmented) // 2)
+        stm32.write(fragmented[:split_at])
+        stm32.flush()
+        if drain_for_reply_type(stm32, MSG_HELLO_ACK, 0.15):
+            raise RuntimeError("fragmented HELLO was handled before completion")
+        stm32.write(fragmented[split_at:])
+        stm32.flush()
+        await_compatible_hello(stm32, fragment_session)
+        print("PASS fragmented frame: no early ACK; ACK after final fragment")
+
+        bad_decoded, _ = build_wire_frame(
+            msg_type=MSG_HELLO,
+            session_id=sticky_session,
+            seq=args.seq + 1,
+            source_timestamp_us=args.timestamp_us,
+        )
+        corrupted = bytearray(bad_decoded)
+        corrupted[-1] ^= 0x01
+        bad_wire = cobs_encode(bytes(corrupted)) + b"\x00"
+        good_wire = hello_wire(sticky_session, args.seq + 2)
+        stm32.write(bad_wire + good_wire)
+        stm32.flush()
+        await_compatible_hello(stm32, sticky_session)
+        print("PASS coalesced frames: bad CRC frame did not block following HELLO")
+
+        oversized_wire = b"\x01" * (MAX_ENCODED_SIZE + 1) + b"\x00"
+        for offset in range(0, len(oversized_wire), 64):
+            stm32.write(oversized_wire[offset : offset + 64])
+            stm32.flush()
+        stm32.write(hello_wire(oversized_session, args.seq + 3))
+        stm32.flush()
+        await_compatible_hello(stm32, oversized_session)
+        print(
+            "PASS oversized frame: "
+            f"{MAX_ENCODED_SIZE + 1}-byte encoded frame discarded; link recovered"
+        )
+
+        # Unknown field 99, length-delimited, containing four arbitrary bytes.
+        unknown_payload = encode_varint((99 << 3) | 2) + b"\x04TEST"
+        stm32.write(
+            hello_wire(unknown_session, args.seq + 4, unknown_payload)
+        )
+        stm32.flush()
+        await_compatible_hello(stm32, unknown_session)
+        print("PASS unknown Protobuf field: HELLO accepted and field skipped")
+
+    print("boundary test passed: 4/4 scenarios")
+
+
 def run_watchdog_test(serial_module, port, args):
     """Establish a session, feed the watchdog, then prove loss is detected."""
     receive_buffer = bytearray()
@@ -1113,6 +1217,7 @@ def main():
             "safe-stop",
             "watchdog-test",
             "gripper-test",
+            "boundary-test",
         ),
         default="hello",
         help="message to build; default: hello",
@@ -1188,6 +1293,8 @@ def main():
         parser.error("watchdog-test requires --send [PORT]")
     if args.message == "gripper-test" and args.send is None:
         parser.error("gripper-test requires --send [PORT]")
+    if args.message == "boundary-test" and args.send is None:
+        parser.error("boundary-test requires --send [PORT]")
     if not 1.0 <= args.rate_hz <= 100.0:
         parser.error("--rate-hz must be in 1..100")
     if args.duration_s > 0.0 and args.bad_crc:
@@ -1196,6 +1303,8 @@ def main():
         parser.error("--bad-crc cannot be combined with watchdog-test")
     if args.message == "gripper-test" and args.bad_crc:
         parser.error("--bad-crc cannot be combined with gripper-test")
+    if args.message == "boundary-test" and args.bad_crc:
+        parser.error("--bad-crc cannot be combined with boundary-test")
     if args.duration_s > 0.0 and args.ttl_ms <= (1000.0 / args.rate_hz):
         parser.error("--ttl-ms must be longer than one repeat interval")
     if args.message in ("watchdog-test", "gripper-test") and (
@@ -1206,7 +1315,7 @@ def main():
         parser.error("gripper-test command ID must be in 1..0xFFFFFFFD")
 
     self_check()
-    if args.message in ("watchdog-test", "gripper-test"):
+    if args.message in ("watchdog-test", "gripper-test", "boundary-test"):
         try:
             import serial
         except ImportError as exc:
@@ -1217,8 +1326,10 @@ def main():
         port = find_stm32() if args.send == "auto" else args.send
         if args.message == "watchdog-test":
             run_watchdog_test(serial, port, args)
-        else:
+        elif args.message == "gripper-test":
             run_gripper_test(serial, port, args)
+        else:
+            run_boundary_test(serial, port, args)
         return
 
     msg_type, payload = build_command_payload(
