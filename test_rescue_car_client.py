@@ -178,10 +178,21 @@ class RescueCarClientTests(unittest.TestCase):
         self.client.safe_stop()
         self.assertFalse(self.client.is_armed)
 
-    def test_close_sends_safe_stop(self):
+    def test_close_sends_safe_stop_when_armed(self):
         serial_port = self.serials[0]
+        self.client.arm()
         self.client.close(stop=True)
         self.assertTrue(
+            any(
+                frame.msg_type == protocol.MSG_SAFE_STOP
+                for frame in serial_port.received
+            )
+        )
+
+    def test_close_preserves_disarmed_state(self):
+        serial_port = self.serials[0]
+        self.client.close(stop=True)
+        self.assertFalse(
             any(
                 frame.msg_type == protocol.MSG_SAFE_STOP
                 for frame in serial_port.received

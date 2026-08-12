@@ -256,7 +256,7 @@ class RescueCarClient:
     def close(self, stop=True, timeout=1.0):
         if self._thread is None:
             return
-        if stop and self.is_connected:
+        if stop and self.is_connected and self.is_armed:
             try:
                 self.safe_stop(timeout=timeout)
             except Exception:

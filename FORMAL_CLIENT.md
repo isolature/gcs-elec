@@ -50,7 +50,7 @@ safety = car.latest_safety_status
 state = car.latest_robot_state
 ```
 
-`close()` 和上下文管理器退出时会尽力发送 `SAFE_STOP`。这只是进程正常退出保护；进程崩溃、USB 断开或树莓派失联时，由 STM32 的 300 ms 心跳看门狗停车。
+`close()` 和上下文管理器退出时，若客户端仍处于 `ARMED`，会尽力发送 `SAFE_STOP`；已经 `DISARMED` 时直接关闭，不改变安全状态。这只是进程正常退出保护；进程崩溃、USB 断开或树莓派失联时，由 STM32 的 300 ms 心跳看门狗停车。
 
 ## 验证
 
@@ -65,4 +65,3 @@ python3 -B -m unittest -v test_rescue_car_client.py
 ```bash
 python3 formal_client_example.py
 ```
-
