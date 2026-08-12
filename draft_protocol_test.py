@@ -10,7 +10,7 @@ import time
 
 MAGIC = b"RC"
 PROTOCOL_VERSION = 1
-SCHEMA_HASH = 0x90245540
+SCHEMA_HASH = 0x0B0ECAF4
 HEADER_SIZE = 32
 CRC_SIZE = 4
 MAX_DECODED_SIZE = 4096
@@ -78,6 +78,9 @@ GRIPPER_TARGET_CLOSED = 2
 DEFAULT_SESSION_ID = 0x12345678
 DEFAULT_SEQ = 1
 DEFAULT_TIMESTAMP_US = 0
+EXPECTED_FIRMWARE_VERSION = 0x00010000
+EXPECTED_CONFIG_HASH = 0x00000000
+CAPABILITY_WHEEL_SPEED = 1 << 0
 
 
 def crc32c(data):
@@ -347,15 +350,97 @@ def print_hello_ack(wire, expected_session_id):
     print(f"reply seq      : {reply['seq']}")
     print(f"reply CRC32C   : 0x{reply['stored_crc']:08X}")
 
+    fields = validate_hello_ack(reply, expected_session_id)
+
+    print(f"firmware       : {format_firmware_version(fields['firmware_version'])}")
+    print(f"boot ID        : 0x{fields['boot_id']:08X}")
+    print(f"config hash    : 0x{fields['config_hash']:08X}")
+    print(f"capabilities   : 0x{fields['capabilities']:08X}")
+    print("HELLO_ACK compatible: ARM may proceed")
+
+
+def validate_hello_ack(reply, expected_session_id):
     if reply["msg_type"] != MSG_HELLO_ACK:
         raise ValueError("reply is not HELLO_ACK")
     if reply["schema_hash"] != SCHEMA_HASH:
         raise ValueError("HELLO_ACK schema hash does not match")
     if reply["session_id"] != expected_session_id:
         raise ValueError("HELLO_ACK session ID does not match")
-    if reply["payload"]:
-        raise ValueError("minimal HELLO_ACK payload should be empty")
-    print("HELLO_ACK valid: protocol, schema, session and CRC all match")
+    fields = decode_hello_ack(reply["payload"])
+    if fields["protocol_version"] != PROTOCOL_VERSION:
+        raise ValueError("HELLO_ACK payload protocol version does not match")
+    if fields["firmware_version"] != EXPECTED_FIRMWARE_VERSION:
+        raise ValueError(
+            "HELLO_ACK firmware version is incompatible: "
+            f"0x{fields['firmware_version']:08X}"
+        )
+    if fields["boot_id"] == 0:
+        raise ValueError("HELLO_ACK boot ID must be non-zero")
+    if fields["config_hash"] != EXPECTED_CONFIG_HASH:
+        raise ValueError(
+            "HELLO_ACK config hash is incompatible: "
+            f"0x{fields['config_hash']:08X}"
+        )
+    if not fields["capabilities"] & CAPABILITY_WHEEL_SPEED:
+        raise ValueError("HELLO_ACK does not advertise wheel-speed feedback")
+    return fields
+
+
+def decode_hello_ack(payload):
+    fields = {}
+    offset = 0
+    while offset < len(payload):
+        key, offset = decode_varint(payload, offset)
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if field_number == 1 and wire_type == 0:
+            fields[field_number], offset = decode_varint(payload, offset)
+        elif field_number in (2, 3, 4, 5) and wire_type == 5:
+            if offset + 4 > len(payload):
+                raise ValueError("truncated HELLO_ACK fixed32 field")
+            fields[field_number] = struct.unpack_from("<I", payload, offset)[0]
+            offset += 4
+        else:
+            raise ValueError(
+                f"unsupported HELLO_ACK field {field_number} wire type {wire_type}"
+            )
+
+    missing = [field for field in range(1, 6) if field not in fields]
+    if missing:
+        raise ValueError(f"HELLO_ACK missing fields: {missing}")
+    return {
+        "protocol_version": fields[1],
+        "firmware_version": fields[2],
+        "boot_id": fields[3],
+        "config_hash": fields[4],
+        "capabilities": fields[5],
+    }
+
+
+def format_firmware_version(version):
+    return f"{version >> 16}.{(version >> 8) & 0xFF}.{version & 0xFF}"
+
+
+def build_hello_ack_payload(
+    *,
+    protocol_version=PROTOCOL_VERSION,
+    firmware_version=EXPECTED_FIRMWARE_VERSION,
+    boot_id=1,
+    config_hash=EXPECTED_CONFIG_HASH,
+    capabilities=CAPABILITY_WHEEL_SPEED,
+):
+    return (
+        b"\x08"
+        + encode_varint(protocol_version)
+        + b"\x15"
+        + struct.pack("<I", firmware_version)
+        + b"\x1D"
+        + struct.pack("<I", boot_id)
+        + b"\x25"
+        + struct.pack("<I", config_hash)
+        + b"\x2D"
+        + struct.pack("<I", capabilities)
+    )
 
 
 def print_command_result(wire, expected_session_id, expected_command_id):
@@ -981,6 +1066,36 @@ def self_check():
     for sample in samples:
         if cobs_decode(cobs_encode(sample)) != sample:
             raise RuntimeError("COBS round-trip self-check failed")
+
+    hello_ack = decode_hello_ack(build_hello_ack_payload(boot_id=0x12345678))
+    if hello_ack != {
+        "protocol_version": PROTOCOL_VERSION,
+        "firmware_version": EXPECTED_FIRMWARE_VERSION,
+        "boot_id": 0x12345678,
+        "config_hash": EXPECTED_CONFIG_HASH,
+        "capabilities": CAPABILITY_WHEEL_SPEED,
+    }:
+        raise RuntimeError("HELLO_ACK payload self-check failed")
+
+    for incompatible_payload in (
+        build_hello_ack_payload(protocol_version=PROTOCOL_VERSION + 1),
+        build_hello_ack_payload(firmware_version=0x00020000),
+        build_hello_ack_payload(boot_id=0),
+        build_hello_ack_payload(config_hash=1),
+        build_hello_ack_payload(capabilities=0),
+    ):
+        _, incompatible_wire = build_wire_frame(
+            msg_type=MSG_HELLO_ACK,
+            payload=incompatible_payload,
+        )
+        try:
+            validate_hello_ack(
+                parse_wire_reply(incompatible_wire), DEFAULT_SESSION_ID
+            )
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError("incompatible HELLO_ACK was accepted")
 
 
 def main():
