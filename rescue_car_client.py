@@ -42,6 +42,15 @@ class CommandRejectedError(RescueCarError):
         self.result = result
 
 
+class RequestTimeoutError(RescueCarError):
+    """A queued request timed out with an intentionally conservative outcome."""
+
+    def __init__(self, operation):
+        super().__init__(f"{operation} request timed out; delivery is uncertain")
+        self.operation = operation
+        self.may_have_applied = True
+
+
 @dataclass(frozen=True)
 class ClientSnapshot:
     connected: bool
@@ -53,6 +62,10 @@ class ClientSnapshot:
     safety_status: object
     robot_state: object
     last_heartbeat_ack_time: float
+    connection_generation: int
+    connected_at: float
+    safety_status_received_at: float
+    robot_state_received_at: float
 
 
 @dataclass
@@ -114,6 +127,10 @@ class RescueCarClient:
         self._safety_status = None
         self._robot_state = None
         self._last_heartbeat_ack_time = 0.0
+        self._connection_generation = 0
+        self._connected_at = 0.0
+        self._safety_status_received_at = 0.0
+        self._robot_state_received_at = 0.0
 
         self._frame_seq = 1
         self._command_id = 1
@@ -144,17 +161,20 @@ class RescueCarClient:
 
     def snapshot(self):
         with self._lock:
-            return ClientSnapshot(
-                self._connected,
-                self._armed,
-                self._port,
-                self._session_id,
-                self._boot_id,
-                self._last_error,
-                self._safety_status,
-                self._robot_state,
-                self._last_heartbeat_ack_time,
-            )
+            return self._snapshot_locked()
+
+    def wait_for_snapshot(self, predicate, timeout):
+        """Wait for a state change and return the latest immutable snapshot."""
+        deadline = time.monotonic() + timeout
+        with self._state_changed:
+            while True:
+                snapshot = self._snapshot_locked()
+                if predicate(snapshot) or not snapshot.connected:
+                    return snapshot
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return snapshot
+                self._state_changed.wait(remaining)
 
     def connect(self, timeout=3.0):
         with self._state_changed:
@@ -190,19 +210,28 @@ class RescueCarClient:
 
     def arm(self, timeout=2.0):
         result = self._request("arm", timeout=timeout)
-        if result.status != protocol.COMMAND_RESULT_ACCEPTED:
+        if result.status not in (
+            protocol.COMMAND_RESULT_ACCEPTED,
+            protocol.COMMAND_RESULT_COMPLETED,
+        ):
             raise CommandRejectedError(result)
         return result
 
     def disarm(self, timeout=2.0):
         result = self._request("disarm", timeout=timeout)
-        if result.status != protocol.COMMAND_RESULT_ACCEPTED:
+        if result.status not in (
+            protocol.COMMAND_RESULT_ACCEPTED,
+            protocol.COMMAND_RESULT_COMPLETED,
+        ):
             raise CommandRejectedError(result)
         return result
 
     def safe_stop(self, timeout=2.0):
         result = self._request("safe_stop", timeout=timeout)
-        if result.status != protocol.COMMAND_RESULT_ACCEPTED:
+        if result.status not in (
+            protocol.COMMAND_RESULT_ACCEPTED,
+            protocol.COMMAND_RESULT_COMPLETED,
+        ):
             raise CommandRejectedError(result)
         return result
 
@@ -249,7 +278,10 @@ class RescueCarClient:
 
     def _gripper(self, opened, timeout):
         result = self._request("gripper", opened, timeout=timeout)
-        if result.status != protocol.COMMAND_RESULT_ACCEPTED:
+        if result.status not in (
+            protocol.COMMAND_RESULT_ACCEPTED,
+            protocol.COMMAND_RESULT_COMPLETED,
+        ):
             raise CommandRejectedError(result)
         return result
 
@@ -280,7 +312,7 @@ class RescueCarClient:
         self._requests.put(request)
         if not request.completed.wait(timeout):
             request.cancelled = True
-            raise RescueCarError(f"{operation} request timed out")
+            raise RequestTimeoutError(operation)
         if request.error is not None:
             raise request.error
         return request.result
@@ -328,14 +360,21 @@ class RescueCarClient:
                 continue
             ack = protocol.parse_hello_ack(frame)
             with self._state_changed:
+                now = time.monotonic()
                 self._connected = True
                 self._armed = False
                 self._port = port
                 self._boot_id = ack.boot_id
                 self._last_error = ""
+                self._safety_status = None
+                self._robot_state = None
+                self._safety_status_received_at = 0.0
+                self._robot_state_received_at = 0.0
+                self._connection_generation += 1
+                self._connected_at = now
                 self._motion = None
-                self._last_heartbeat_ack_time = time.monotonic()
-                self._next_heartbeat_time = time.monotonic()
+                self._last_heartbeat_ack_time = now
+                self._next_heartbeat_time = now
                 self._state_changed.notify_all()
             return
         raise NotConnectedError("no compatible HELLO_ACK within 1 second")
@@ -399,11 +438,15 @@ class RescueCarClient:
         result = self._wait_for_command_result(command_id, 1.0)
         if result is None:
             raise RescueCarError(f"no result for command {command_id}")
+        succeeded = result.status in (
+            protocol.COMMAND_RESULT_ACCEPTED,
+            protocol.COMMAND_RESULT_COMPLETED,
+        )
         with self._lock:
-            if operation == "arm" and result.status == protocol.COMMAND_RESULT_ACCEPTED:
+            if operation == "arm" and succeeded:
                 self._armed = True
                 self._next_heartbeat_time = time.monotonic()
-            elif operation in ("disarm", "safe_stop"):
+            elif operation in ("disarm", "safe_stop") and succeeded:
                 self._armed = False
                 self._motion = None
         return result
@@ -490,15 +533,19 @@ class RescueCarClient:
                 self._last_heartbeat_ack_time = time.monotonic()
         elif frame.msg_type == protocol.MSG_SAFETY_STATUS:
             status = protocol.parse_safety_status(frame)
-            with self._lock:
+            with self._state_changed:
                 self._safety_status = status
+                self._safety_status_received_at = time.monotonic()
                 self._armed = status.armed
                 if not status.armed:
                     self._motion = None
+                self._state_changed.notify_all()
         elif frame.msg_type == protocol.MSG_ROBOT_STATE:
             state = protocol.parse_robot_state(frame)
-            with self._lock:
+            with self._state_changed:
                 self._robot_state = state
+                self._robot_state_received_at = time.monotonic()
+                self._state_changed.notify_all()
         return None
 
     def _next_command_id(self):
@@ -537,5 +584,26 @@ class RescueCarClient:
             self._session_id = 0
             self._boot_id = 0
             self._motion = None
+            self._safety_status = None
+            self._robot_state = None
+            self._safety_status_received_at = 0.0
+            self._robot_state_received_at = 0.0
             self._last_error = error
             self._state_changed.notify_all()
+
+    def _snapshot_locked(self):
+        return ClientSnapshot(
+            self._connected,
+            self._armed,
+            self._port,
+            self._session_id,
+            self._boot_id,
+            self._last_error,
+            self._safety_status,
+            self._robot_state,
+            self._last_heartbeat_ack_time,
+            self._connection_generation,
+            self._connected_at,
+            self._safety_status_received_at,
+            self._robot_state_received_at,
+        )
