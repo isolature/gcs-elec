@@ -3,7 +3,7 @@
 正式比赛固件的唯一上位机控制路径是：
 
 ```text
-浏览器调试入口 / 自动决策
+终端键盘遥控 / 浏览器调试入口 / 自动决策
             ↓
        ControlCore
             ↓
@@ -48,6 +48,37 @@ finally:
 
 `formal_client_example.py` 提供同一控制链的命令行示例，并要求用 `--port` 显式指定串口。
 
+## Pi 终端键盘遥控
+
+部署到 `/home/gcs/gcs-elec` 后，使用稳定的设备唯一标识启动：
+
+```bash
+cd /home/gcs/gcs-elec
+./run_teleop.sh \
+  --port /dev/serial/by-id/usb-STMicroelectronics_STM32_Virtual_ComPort_348935793135-if00
+```
+
+等价的模块入口是：
+
+```bash
+python3 -m rescue_control teleop --port /dev/serial/by-id/<exact-device-name>
+```
+
+`--port` 必填且只接受 `/dev/serial/by-id/` 下的精确单设备路径；不会回退或自动发现为 `/dev/ttyACM0`。脚本会把参数和 Python 退出状态原样传递，不隐藏连接、协议或清理失败。
+
+键位如下：
+
+- `R`：取得控制权并 ARM；租约超时或安全停车后会取得新一代控制权，不复用旧运动目标。
+- `U`：DISARM。
+- `W` / `S` / `A` / `D`：前进、后退、左转、右转。
+- `Space`：普通停车。
+- `O` / `C`：夹爪张开、合拢。
+- `E`：安全停车。
+- `H` 或 `?`：显示帮助和当前 `ControlCore` 状态。
+- `Q`：执行安全清理并退出。
+
+终端无法可靠获得松键事件，因此运动依靠操作系统的按键重复持续刷新 500 ms 输入租约；停止收到成功运动输入后，租约超时由 `ControlCore` 触发安全停车。不要把键盘重复延迟设置得接近或超过 500 ms；松键时可按 `Space` 立即普通停车。EOF、Ctrl-C、未处理异常、连接中断和正常退出都会进入 `ControlCore.shutdown(reason)`，尝试安全停车后关闭唯一正式串口。
+
 ## 关键语义
 
 - HELLO_ACK 后还必须收到当前连接代次内、结构有效且新鲜的 `SAFETY_STATUS` 和 `ROBOT_STATE`，业务层 `connect()` 才成功。
@@ -67,9 +98,13 @@ finally:
 ```bash
 python3 -B -m unittest -v test_rescue_car_client.py
 python3 -B -m unittest -v tests.test_competition_lower_link
+python3 -B -m unittest -v tests.test_cli
 python3 -B -m unittest discover -v
 python3 -B -m rescue_control scenario all
+sh -n run_teleop.sh
 git diff --check
 ```
 
-这些结果只证明 WSL 逻辑与假串口行为。Pi 的 `/dev/serial/by-id/...`、正式 STM32 commit/schema、真实状态节拍、看门狗、架空车轮和实车闭环仍需分别验收。
+`tests.test_cli` 用 `FakeLowerLink` 覆盖全部键位、帮助、输入超时、新代际重新 ARM、EOF、Ctrl-C、异常、连接中断和正常退出；正式入口测试以注入 Fake 的方式断言 `CompetitionLowerLink` 构造路径，不会打开真实串口。
+
+这些结果只证明 WSL 逻辑、Fake 后端与假串口行为。Pi 的 `/dev/serial/by-id/...` 权限和独占打开、终端按键重复节拍、正式 STM32 commit/schema、真实状态节拍、看门狗、架空车轮和实车闭环仍需分别验收。

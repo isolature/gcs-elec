@@ -1,4 +1,4 @@
-"""Fake-only command-line rehearsal for the upper control boundary."""
+"""Command-line rehearsal and deployable terminal teleoperation entry points."""
 
 from __future__ import annotations
 
@@ -43,26 +43,30 @@ MOTION_KEYS = {
     "d": (0, -800, "turn_right"),
 }
 INTERACTIVE_KEY_BINDINGS = {
-    "L": "acquire or renew the 500 ms input lease",
-    "R": "ARM",
+    "R": "acquire control and ARM",
     "U": "DISARM",
-    "W/S": "forward/backward pulse",
-    "A/D": "left/right turn pulse",
-    "Space/X": "explicit key-release substitute: ordinary stop",
+    "W/S/A/D": "forward/backward/left/right; repeat to refresh control",
+    "Space": "ordinary stop",
     "O/C": "open/close gripper",
     "E": "user-requested safety stop",
-    "V": "release the input lease",
-    "?": "show this help and current status",
-    "Q": "quit with shutdown cleanup",
+    "H/?": "show help and current status",
+    "Q": "quit with safety cleanup",
 }
 
 INTERACTIVE_HELP_MESSAGE = (
-    "L acquire/renew lease; R ARM; U DISARM; W/S forward/backward; "
-    "A/D turn left/right; Space/X explicit key-release substitute (ordinary stop); "
-    "O/C gripper OPEN/CLOSED; E safety stop; V release lease; ? status/help; "
-    "Q quit. This terminal cannot reliably detect physical key-up: repeat motion "
-    "keys to renew the 500 ms deadman lease and press Space/X when releasing a "
-    "key. If successful input renewal stops, lease expiry causes safety stop."
+    "Keyboard teleoperation:\n"
+    "  R       acquire control and ARM\n"
+    "  U       DISARM\n"
+    "  W/S     forward/backward\n"
+    "  A/D     turn left/right\n"
+    "  Space   ordinary stop\n"
+    "  O/C     gripper OPEN/CLOSED\n"
+    "  E       safety stop\n"
+    "  H or ?  help and current status\n"
+    "  Q       quit with safety cleanup\n"
+    "This terminal cannot reliably detect physical key-up. Repeat W/S/A/D to "
+    "refresh the 500 ms input timeout; when repeats stop, lease expiry causes a "
+    "safety stop. Press Space for an immediate ordinary stop."
 )
 
 
@@ -759,7 +763,21 @@ def run_interactive_session(
         _emit_interactive_help(writer, core, event="interactive_start")
         while True:
             key = source.read(poll_interval_s)
-            core.poll()
+            snapshot = core.poll()
+            if snapshot.lease is None:
+                token = None
+            if not snapshot.connected:
+                cause = SafeStopReason.LINK_DISCONNECTED
+                exit_code = 70
+                writer.emit(
+                    "termination",
+                    "LINK_DISCONNECTED",
+                    "ERROR",
+                    core=core,
+                    error_code=CoreErrorCode.BACKEND_DISCONNECTED.value,
+                    message="lower-controller connection was lost",
+                )
+                break
             if key is None:
                 continue
             if key == "":
@@ -770,21 +788,20 @@ def run_interactive_session(
                 if normalized == "q":
                     cause = SafeStopReason.SHUTDOWN
                     break
-                if normalized == "l":
-                    if token is not None and core.snapshot().lease is not None:
-                        core.renew_lease(token, INTERACTIVE_LEASE_S)
-                    else:
-                        token = core.acquire_lease(owner, INTERACTIVE_LEASE_S)
-                    writer.emit("key", "LEASE", "OK", core=core)
-                    continue
                 if normalized == "r":
-                    if token is None:
-                        raise InvalidControlInput(
-                            CoreErrorCode.INVALID_INPUT,
-                            "press L to acquire a lease before ARM",
+                    snapshot = core.snapshot()
+                    already_owned = token is not None and snapshot.lease is not None
+                    if not already_owned:
+                        token = core.acquire_lease(owner, INTERACTIVE_LEASE_S)
+                    else:
+                        core.renew_lease(token, INTERACTIVE_LEASE_S)
+                    if already_owned and snapshot.mode is CoreMode.ARMED:
+                        writer.emit("key", "ARM", "ALREADY_ARMED", core=core)
+                    else:
+                        result = core.arm(token)
+                        writer.emit(
+                            "key", "ARM", result.status.value, core=core
                         )
-                    result = core.arm(token)
-                    writer.emit("key", "ARM", result.status.value, core=core)
                     continue
                 if normalized == "u":
                     if token is None:
@@ -794,15 +811,6 @@ def run_interactive_session(
                     result = core.disarm(token)
                     writer.emit("key", "DISARM", result.status.value, core=core)
                     continue
-                if normalized == "v":
-                    if token is None:
-                        raise InvalidControlInput(
-                            CoreErrorCode.INVALID_INPUT, "no lease token"
-                        )
-                    core.release_lease(token)
-                    token = None
-                    writer.emit("key", "RELEASE", "OK", core=core)
-                    continue
                 if normalized == "e":
                     result = core.safe_stop(SafeStopReason.USER_REQUEST)
                     token = None
@@ -810,13 +818,27 @@ def run_interactive_session(
                         "key", "SAFE_STOP", result.status.value, core=core
                     )
                     continue
-                if normalized == "?":
+                if normalized in ("h", "?"):
                     _emit_interactive_help(writer, core, event="key")
+                    continue
+                if normalized not in MOTION_KEYS and normalized not in (
+                    " ",
+                    "o",
+                    "c",
+                ):
+                    writer.emit(
+                        "key",
+                        _key_name(key),
+                        "IGNORED",
+                        core=core,
+                        error_code="UNKNOWN_KEY",
+                        message="unknown key; press H or ? for help",
+                    )
                     continue
                 if token is None:
                     raise InvalidControlInput(
                         CoreErrorCode.INVALID_INPUT,
-                        "press L to acquire a lease before control",
+                        "no active control; press R to acquire control and ARM",
                     )
                 result = apply_control_key(core, token, key)
                 writer.emit(
@@ -837,6 +859,26 @@ def run_interactive_session(
     except KeyboardInterrupt:
         cause = SafeStopReason.KEYBOARD_INTERRUPT
         exit_code = 130
+    except CoreError as exc:
+        cause = (
+            SafeStopReason.LINK_DISCONNECTED
+            if exc.code
+            in (CoreErrorCode.NOT_CONNECTED, CoreErrorCode.BACKEND_DISCONNECTED)
+            else SafeStopReason.BACKEND_FAILURE
+        )
+        exit_code = 70
+        try:
+            writer.emit(
+                "interactive",
+                type(exc).__name__,
+                "ERROR",
+                core=core,
+                error_code=exc.code.value,
+                message=str(exc),
+                **_core_error_details(exc),
+            )
+        except Exception:
+            pass
     except Exception as exc:
         cause = SafeStopReason.UNHANDLED_EXCEPTION
         exit_code = 70
@@ -913,6 +955,22 @@ def _key_name(key: str) -> str:
     if not key:
         return "EOF"
     return key.upper()
+
+
+def _by_id_serial_port(value: str) -> str:
+    prefix = "/dev/serial/by-id/"
+    suffix = value[len(prefix):] if value.startswith(prefix) else ""
+    if (
+        value != value.strip()
+        or not suffix
+        or "/" in suffix
+        or suffix in (".", "..")
+    ):
+        raise argparse.ArgumentTypeError(
+            "--port must be an exact stable path under /dev/serial/by-id/; "
+            "/dev/ttyACM0 is not accepted"
+        )
+    return value
 
 
 BUILTIN_SCENARIOS: dict[str, tuple[str, int]] = {
@@ -1193,7 +1251,7 @@ def run_builtin_scenarios(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 -m rescue_control",
-        description="Hardware-free Rescue Robot ControlCore rehearsal",
+        description="Rescue Robot ControlCore tools and terminal teleoperation",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1201,6 +1259,17 @@ def build_parser() -> argparse.ArgumentParser:
         "interactive", help="Fake backend, deadman-pulse keyboard rehearsal"
     )
     interactive.add_argument("--json", action="store_true", help="emit NDJSON")
+
+    teleop = subparsers.add_parser(
+        "teleop", help="control the formal lower link from a Pi terminal"
+    )
+    teleop.add_argument(
+        "--port",
+        required=True,
+        type=_by_id_serial_port,
+        metavar="/dev/serial/by-id/...",
+        help="exact stable STM32 serial path; /dev/ttyACM0 is not accepted",
+    )
 
     script = subparsers.add_parser(
         "script", help="run a deterministic scenario DSL file"
@@ -1233,6 +1302,15 @@ def main(
         writer = OutputWriter(stdout, json_mode=args.json, clock=clock)
         return run_interactive_session(
             core, TerminalInputSource(stdin), writer
+        )
+    if args.command == "teleop":
+        from .competition_lower_link import CompetitionLowerLink
+
+        clock = time.monotonic
+        core = ControlCore(CompetitionLowerLink(port=args.port), clock=clock)
+        writer = OutputWriter(stdout, json_mode=False, clock=clock)
+        return run_interactive_session(
+            core, TerminalInputSource(stdin), writer, owner="terminal-teleop"
         )
     if args.command == "script":
         clock = ManualClock()

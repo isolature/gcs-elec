@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +23,7 @@ from rescue_control.cli import (
     OutputWriter,
     ScenarioRunner,
     apply_control_key,
+    build_parser,
     main,
     run_builtin_scenarios,
     run_interactive_session,
@@ -289,6 +291,8 @@ class EventSource:
         event = self.events.pop(0)
         if isinstance(event, BaseException):
             raise event
+        if callable(event):
+            return event()
         return event
 
     def __exit__(self, exc_type, exc, traceback):
@@ -358,10 +362,10 @@ class InteractiveCleanupTests(unittest.TestCase):
 
     def test_normal_eof_ctrl_c_and_unhandled_all_restore_and_clean(self) -> None:
         cases = (
-            (["l", "r", "w", "q"], 0, "SHUTDOWN"),
-            (["l", "r", "w", ""], 0, "EOF"),
-            (["l", "r", "w", KeyboardInterrupt()], 130, "KEYBOARD_INTERRUPT"),
-            (["l", "r", "w", RuntimeError("boom")], 70, "UNHANDLED_EXCEPTION"),
+            (["r", "w", "q"], 0, "SHUTDOWN"),
+            (["r", "w", ""], 0, "EOF"),
+            (["r", "w", KeyboardInterrupt()], 130, "KEYBOARD_INTERRUPT"),
+            (["r", "w", RuntimeError("boom")], 70, "UNHANDLED_EXCEPTION"),
         )
         for events, expected_code, reason in cases:
             with self.subTest(reason=reason):
@@ -375,16 +379,20 @@ class InteractiveCleanupTests(unittest.TestCase):
                 operations = [r.operation for r in fake.history]
                 self.assertEqual(operations[-2:], ["safe_stop", "close"])
                 self.assertEqual(records[-1]["event"], "summary")
+                self.assertEqual(records[-1]["safety_reason"], reason)
 
     def test_all_interactive_controls_case_and_help_are_observable(self) -> None:
         code, source, _, fake, records = self.run_events(
-            ["L", "R", "O", "c", "W", "X", "U", "V", "?", "Q"]
+            [
+                "R", "O", "c", "W", " ", "s", " ", "A", " ", "d", " ",
+                "U", "r", "H", "?", "Q",
+            ]
         )
         self.assertEqual(code, 0)
         self.assertEqual(source.exit_count, 1)
         actions = [record["action"] for record in records]
         for action in (
-            "LEASE", "ARM", "O", "C", "W", "X", "DISARM", "RELEASE",
+            "ARM", "O", "C", "W", "SPACE", "S", "A", "D", "DISARM",
             "STATUS_HELP",
         ):
             self.assertIn(action, actions)
@@ -394,25 +402,24 @@ class InteractiveCleanupTests(unittest.TestCase):
             for record in records
             if record["action"] == "STATUS_HELP"
         ]
-        self.assertEqual(len(help_records), 2)
+        self.assertEqual(len(help_records), 3)
         for record in help_records:
             self.assertFalse(record["reliable_key_up"])
             self.assertEqual(record["lease_timeout_ms"], 500)
             self.assertEqual(
                 set(record["keys"]),
                 {
-                    "L", "R", "U", "W/S", "A/D", "Space/X",
-                    "O/C", "E", "V", "?", "Q",
+                    "R", "U", "W/S/A/D", "Space", "O/C", "E", "H/?", "Q",
                 },
             )
             self.assertIn("cannot reliably detect physical key-up", record["message"])
-            self.assertIn("Space/X", record["message"])
+            self.assertIn("Space", record["message"])
 
     def test_explicit_e_safe_stop_is_observable_in_both_cases(self) -> None:
         for key in ("E", "e"):
             with self.subTest(key=key):
                 code, source, _, fake, records = self.run_events(
-                    ["L", "R", "W", key, "?", "Q"]
+                    ["R", "W", key, "?", "Q"]
                 )
                 self.assertEqual(code, 0)
                 self.assertEqual(source.exit_count, 1)
@@ -424,15 +431,15 @@ class InteractiveCleanupTests(unittest.TestCase):
                 self.assertEqual(safe_stop["safety_reason"], "USER_REQUEST")
                 self.assertGreaterEqual(fake.count("safe_stop"), 2)
 
-    def test_lowercase_disarm_and_release_are_observable(self) -> None:
+    def test_lowercase_disarm_and_rearm_are_observable(self) -> None:
         code, source, _, _, records = self.run_events(
-            ["l", "r", "u", "v", "q"]
+            ["r", "u", "r", "q"]
         )
         self.assertEqual(code, 0)
         self.assertEqual(source.exit_count, 1)
         actions = [record["action"] for record in records]
         self.assertIn("DISARM", actions)
-        self.assertIn("RELEASE", actions)
+        self.assertEqual(actions.count("ARM"), 2)
 
     def test_late_motion_key_after_deadline_cannot_reactivate(self) -> None:
         clock = ManualClock()
@@ -441,7 +448,7 @@ class InteractiveCleanupTests(unittest.TestCase):
         output = io.StringIO()
         source = AdvancingEventSource(
             clock,
-            [(0, "L"), (0, "R"), (0, "W"), (0.5, "W"), (0, "Q")],
+            [(0, "R"), (0, "W"), (0.5, "W"), (0, "Q")],
         )
         writer = OutputWriter(output, json_mode=True, clock=clock)
         code = run_interactive_session(core, source, writer)
@@ -459,11 +466,73 @@ class InteractiveCleanupTests(unittest.TestCase):
         )
         self.assertEqual(
             motion_records[-1]["error_code"],
-            CoreErrorCode.INVALID_LEASE.value,
+            CoreErrorCode.INVALID_INPUT.value,
         )
         self.assertEqual(
             motion_records[-1]["safety_reason"], "COMMAND_TIMEOUT"
         )
+
+    def test_motion_repeat_refreshes_lease_without_a_management_key(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = ControlCore(fake, clock=clock)
+        output = io.StringIO()
+        source = AdvancingEventSource(
+            clock,
+            [(0, "R"), (0, "W"), (0.49, "W"), (0.49, "W"), (0, "Q")],
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 0)
+        self.assertEqual(fake.count("set_chassis"), 3)
+        timeout_events = [
+            event
+            for event in core.events
+            if event.event == "safe_stop"
+            and dict(event.details).get("reason") == "COMMAND_TIMEOUT"
+        ]
+        self.assertEqual(timeout_events, [])
+
+    def test_r_after_timeout_uses_new_authority_without_replaying_motion(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = ControlCore(fake, clock=clock)
+        output = io.StringIO()
+        source = AdvancingEventSource(
+            clock,
+            [(0, "R"), (0, "W"), (0.5, None), (0, "R"), (0, "Q")],
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 0)
+        self.assertEqual(fake.count("set_chassis"), 1)
+        self.assertEqual(fake.count("arm"), 2)
+        arm_records = [
+            record
+            for record in parse_ndjson(output)
+            if record["event"] == "key" and record["action"] == "ARM"
+        ]
+        self.assertEqual(len(arm_records), 2)
+        self.assertGreater(
+            arm_records[1]["lease_generation"],
+            arm_records[0]["lease_generation"],
+        )
+
+    def test_link_disconnect_terminates_and_runs_cleanup(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = ControlCore(fake, clock=clock)
+        output = io.StringIO()
+        source = EventSource(
+            ["R", "W", lambda: (fake.inject_disconnect(), None)[1]]
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 70)
+        self.assertEqual(source.exit_count, 1)
+        self.assertIsNone(core.snapshot().lease)
+        self.assertEqual(core.snapshot().mode.value, "CLOSED")
+        self.assertEqual([record.operation for record in fake.history][-1], "close")
+        summary = parse_ndjson(output)[-1]
+        self.assertEqual(summary["exit_code"], 70)
+        self.assertEqual(summary["safety_reason"], "LINK_DISCONNECTED")
 
     def test_writer_and_shutdown_failures_restore_terminal_exactly_once(self) -> None:
         for writer_kind in ("permanent", "cleanup", "summary"):
@@ -510,7 +579,8 @@ class InteractiveCleanupTests(unittest.TestCase):
             run_interactive_session(core, source, writer), 0
         )
         self.assertIn("cannot reliably detect physical key-up", output.getvalue())
-        self.assertIn("Space/X", output.getvalue())
+        self.assertIn("Space", output.getvalue())
+        self.assertNotIn("acquire/renew lease", output.getvalue())
 
     def test_terminal_restore_failure_is_reported_as_runtime_failure(self) -> None:
         code, source, _, _, records = self.run_events(["q"], exit_error=RuntimeError("restore"))
@@ -552,6 +622,58 @@ class ImportIsolationTests(unittest.TestCase):
                 capture_output=True,
             )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
+class TeleopEntryTests(unittest.TestCase):
+    def test_teleop_requires_an_exact_by_id_port(self) -> None:
+        parser = build_parser()
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["teleop"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["teleop", "--port", "/dev/ttyACM0"])
+        self.assertIn("required: --port", errors.getvalue())
+        self.assertIn("/dev/ttyACM0 is not accepted", errors.getvalue())
+        args = parser.parse_args(
+            ["teleop", "--port", "/dev/serial/by-id/usb-STM32-test"]
+        )
+        self.assertEqual(args.command, "teleop")
+
+    def test_teleop_builds_competition_link_and_reuses_keyboard_loop(self) -> None:
+        fake = FakeLowerLink()
+        source = EventSource(["Q"])
+        output = io.StringIO()
+        port = "/dev/serial/by-id/usb-STM32-test"
+        with patch(
+            "rescue_control.competition_lower_link.CompetitionLowerLink",
+            return_value=fake,
+        ) as link_factory, patch(
+            "rescue_control.cli.TerminalInputSource", return_value=source
+        ):
+            code = main(
+                ["teleop", "--port", port],
+                stdout=output,
+                stdin=io.StringIO(),
+            )
+        self.assertEqual(code, 0)
+        link_factory.assert_called_once_with(port=port)
+        self.assertEqual([record.operation for record in fake.history], [
+            "connect", "get_health", "get_robot_state", "get_health",
+            "safe_stop", "close"
+        ])
+
+    def test_run_script_no_args_fails_clearly_without_starting_python(self) -> None:
+        script = REPO_ROOT / "run_teleop.sh"
+        self.assertNotEqual(script.stat().st_mode & 0o111, 0)
+        completed = subprocess.run(
+            ["sh", str(script)],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("--port /dev/serial/by-id/", completed.stderr)
 
 
 if __name__ == "__main__":
