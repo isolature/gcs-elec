@@ -6,7 +6,14 @@ import time
 import unittest
 
 import rescue_car_protocol as protocol
-from rescue_car_client import NotArmedError, RescueCarClient
+from rescue_car_client import CommandRejectedError, NotArmedError, RescueCarClient
+from rescue_control import (
+    CommandStatus,
+    CompetitionLinkConfig,
+    CompetitionLowerLink,
+    ControlCore,
+    SafeStopReason,
+)
 
 
 def _field(number, value):
@@ -21,6 +28,10 @@ def _fixed64_field(number, value):
     return protocol.encode_varint((number << 3) | 1) + struct.pack("<Q", value)
 
 
+def _signed_field(number, value):
+    return protocol.encode_varint(number << 3) + protocol.encode_sint32(value)
+
+
 class FakeStm32Serial:
     def __init__(self, **_kwargs):
         self.timeout = 0.02
@@ -30,6 +41,12 @@ class FakeStm32Serial:
         self._condition = threading.Condition()
         self._reply_seq = 1
         self._armed = False
+        self._safety_state = protocol.SAFETY_STATE_DISARMED
+        self._state_seq = 1
+        self._linear = 0
+        self._angular = 0
+        self._gripper = protocol.GRIPPER_STATE_UNKNOWN
+        self.command_result_status = protocol.COMMAND_RESULT_ACCEPTED
 
     def reset_input_buffer(self):
         with self._condition:
@@ -49,6 +66,8 @@ class FakeStm32Serial:
                 + _fixed32_field(5, protocol.CAPABILITY_WHEEL_SPEED)
             )
             self._reply(frame, protocol.MSG_HELLO_ACK, payload)
+            self._reply_safety(frame)
+            self._reply_robot(frame)
         elif frame.msg_type == protocol.MSG_HEARTBEAT:
             fields = protocol._varint_fields(frame.payload)
             payload = _field(1, fields[1]) + _fixed64_field(2, 123456)
@@ -60,16 +79,45 @@ class FakeStm32Serial:
         ):
             fields = protocol._varint_fields(frame.payload)
             command_id = fields[2]
-            if frame.msg_type == protocol.MSG_ARM_COMMAND:
-                self._armed = fields[1] == protocol.ARM_TARGET_ARMED
-            elif frame.msg_type == protocol.MSG_SAFE_STOP:
-                self._armed = False
+            succeeded = self.command_result_status in (
+                protocol.COMMAND_RESULT_ACCEPTED,
+                protocol.COMMAND_RESULT_COMPLETED,
+            )
+            if succeeded:
+                if frame.msg_type == protocol.MSG_ARM_COMMAND:
+                    self._armed = fields[1] == protocol.ARM_TARGET_ARMED
+                    self._safety_state = (
+                        protocol.SAFETY_STATE_ARMED
+                        if self._armed
+                        else protocol.SAFETY_STATE_DISARMED
+                    )
+                    if not self._armed:
+                        self._linear = 0
+                        self._angular = 0
+                elif frame.msg_type == protocol.MSG_SAFE_STOP:
+                    self._armed = False
+                    self._safety_state = protocol.SAFETY_STATE_SAFE_STOP
+                    self._linear = 0
+                    self._angular = 0
+                elif frame.msg_type == protocol.MSG_GRIPPER_COMMAND:
+                    self._gripper = (
+                        protocol.GRIPPER_STATE_OPEN
+                        if fields[1] == protocol.GRIPPER_TARGET_OPEN
+                        else protocol.GRIPPER_STATE_CLOSED
+                    )
             payload = (
                 _field(1, command_id)
-                + _field(2, protocol.COMMAND_RESULT_ACCEPTED)
+                + _field(2, self.command_result_status)
                 + _field(3, 1)
             )
             self._reply(frame, protocol.MSG_COMMAND_RESULT, payload)
+            self._reply_safety(frame)
+            self._reply_robot(frame)
+        elif frame.msg_type == protocol.MSG_CHASSIS_SETPOINT:
+            fields = protocol._varint_fields(frame.payload)
+            self._linear = protocol.decode_sint32(fields.get(1, 0))
+            self._angular = protocol.decode_sint32(fields.get(2, 0))
+            self._reply_robot(frame)
         return len(data)
 
     def flush(self):
@@ -104,6 +152,34 @@ class FakeStm32Serial:
         with self._condition:
             self._rx.extend(wire)
             self._condition.notify_all()
+
+    def _reply_safety(self, request):
+        payload = (
+            _field(1, 1)
+            + _field(2, int(self._armed))
+            + _field(3, self._safety_state)
+            + _field(4, 1)
+            + _fixed32_field(5, 0)
+            + _field(6, 0)
+            + _field(7, 12_000)
+            + _field(8, 0)
+            + _fixed32_field(9, 15)
+        )
+        self._reply(request, protocol.MSG_SAFETY_STATUS, payload)
+
+    def _reply_robot(self, request):
+        payload = (
+            _field(1, self._state_seq)
+            + _fixed64_field(2, self._state_seq * 1_000)
+            + _field(3, protocol.COORDINATE_FRAME_BASE_LINK)
+            + _field(4, request.seq)
+            + _signed_field(5, self._linear)
+            + _signed_field(6, self._angular)
+            + _field(12, self._gripper)
+            + _fixed32_field(13, 15)
+        )
+        self._state_seq += 1
+        self._reply(request, protocol.MSG_ROBOT_STATE, payload)
 
 
 class RescueCarProtocolTests(unittest.TestCase):
@@ -147,6 +223,21 @@ class RescueCarClientTests(unittest.TestCase):
         with self.assertRaises(NotArmedError):
             self.client.set_velocity(150, 0)
 
+    def test_snapshot_exposes_fresh_state_receipt_times_and_generation(self):
+        snapshot = self.client.wait_for_snapshot(
+            lambda value: (
+                value.safety_status is not None and value.robot_state is not None
+            ),
+            0.5,
+        )
+        self.assertGreater(snapshot.connection_generation, 0)
+        self.assertGreaterEqual(
+            snapshot.safety_status_received_at, snapshot.connected_at
+        )
+        self.assertGreaterEqual(
+            snapshot.robot_state_received_at, snapshot.connected_at
+        )
+
     def test_arm_motion_refresh_stop_and_disarm(self):
         self.client.arm()
         self.client.set_velocity(150, 0, ttl_ms=300)
@@ -177,6 +268,20 @@ class RescueCarClientTests(unittest.TestCase):
         self.assertEqual(result.status, protocol.COMMAND_RESULT_ACCEPTED)
         self.client.safe_stop()
         self.assertFalse(self.client.is_armed)
+
+    def test_completed_arm_and_rejected_disarm_preserve_local_authority(self):
+        serial_port = self.serials[0]
+        serial_port.command_result_status = protocol.COMMAND_RESULT_COMPLETED
+        result = self.client.arm()
+        self.assertEqual(result.status, protocol.COMMAND_RESULT_COMPLETED)
+        self.assertTrue(self.client.is_armed)
+        self.client.set_velocity(50, 0)
+
+        serial_port.command_result_status = protocol.COMMAND_RESULT_REJECTED
+        with self.assertRaises(CommandRejectedError):
+            self.client.disarm()
+        self.assertTrue(self.client.is_armed)
+        serial_port.command_result_status = protocol.COMMAND_RESULT_ACCEPTED
 
     def test_close_sends_safe_stop_when_armed(self):
         serial_port = self.serials[0]
@@ -233,6 +338,53 @@ class RescueCarClientTests(unittest.TestCase):
         instance = FakeStm32Serial(**kwargs)
         self.serials.append(instance)
         return instance
+
+
+class FormalControlIntegrationTests(unittest.TestCase):
+    def test_core_to_formal_client_uses_only_fake_serial_and_confirms_state(self):
+        serials = []
+
+        def factory(**kwargs):
+            instance = FakeStm32Serial(**kwargs)
+            serials.append(instance)
+            return instance
+
+        link = CompetitionLowerLink(
+            port="/dev/serial/by-id/usb-STM32-fake",
+            serial_factory=factory,
+            reconnect=False,
+            config=CompetitionLinkConfig(
+                connect_timeout_s=1.0,
+                initial_feedback_timeout_s=1.0,
+                confirmation_timeout_s=0.25,
+                feedback_stale_after_s=0.5,
+            ),
+        )
+        core = ControlCore(link)
+        core.connect()
+        token = core.acquire_lease("integration", duration_s=1.0)
+        self.assertEqual(core.arm(token).status, CommandStatus.COMPLETED)
+        self.assertEqual(
+            core.set_chassis(token, 120, 0, 300).status,
+            CommandStatus.SENT,
+        )
+        self.assertEqual(core.stop(token).status, CommandStatus.COMPLETED)
+        self.assertEqual(
+            core.safe_stop(SafeStopReason.USER_REQUEST).status,
+            CommandStatus.COMPLETED,
+        )
+        self.assertEqual(
+            core.safe_stop(SafeStopReason.SHUTDOWN).status,
+            CommandStatus.COMPLETED,
+        )
+        cleanup = core.shutdown(SafeStopReason.SHUTDOWN)
+        self.assertTrue(cleanup.ok)
+        frames = serials[0].received
+        self.assertEqual(
+            sum(frame.msg_type == protocol.MSG_SAFE_STOP for frame in frames),
+            3,
+        )
+        self.assertFalse(serials[0].is_open)
 
 
 if __name__ == "__main__":
