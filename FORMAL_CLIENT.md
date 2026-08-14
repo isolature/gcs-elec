@@ -68,16 +68,35 @@ python3 -m rescue_control teleop --port /dev/serial/by-id/<exact-device-name>
 
 键位如下：
 
-- `R`：取得控制权并 ARM；租约超时或安全停车后会取得新一代控制权，不复用旧运动目标。
-- `U`：DISARM。
-- `W` / `S` / `A` / `D`：前进、后退、左转、右转。
-- `Space`：普通停车。
+- `R`：按一次取得控制权并 ARM；正常操控期间不需要按住或重复按。租约超时、安全停车或断连后，`R` 取得新一代控制权，不复用旧运动目标。
+- `U`：DISARM（保留控制权，`R` 重新 ARM）。
+- `W` / `S` / `A` / `D`：前进、后退、左转、右转；按住持续运动（依赖系统按键重复，约 25–30 Hz）。
+- `Space`：普通停车，保留控制权和 ARM；随后可直接继续运动键。
 - `O` / `C`：夹爪张开、合拢。
-- `E`：安全停车。
+- `E`：安全停车并解除控制权；`R` 重新取权。
 - `H` 或 `?`：显示帮助和当前 `ControlCore` 状态。
 - `Q`：执行安全清理并退出。
 
-终端无法可靠获得松键事件，因此运动依靠操作系统的按键重复持续刷新 500 ms 输入租约；停止收到成功运动输入后，租约超时由 `ControlCore` 触发安全停车。不要把键盘重复延迟设置得接近或超过 500 ms；松键时可按 `Space` 立即普通停车。EOF、Ctrl-C、未处理异常、连接中断和正常退出都会进入 `ControlCore.shutdown(reason)`，尝试安全停车后关闭唯一正式串口。
+输入超时与松键语义（`rescue_control/cli.py`）：
+
+- 终端无法可靠获得物理松键事件。运动键依靠按键重复维持；当重复停止约 150 ms（`MOTION_RELEASE_S`）且当前存在非零速度设定时，交互循环主动经 `ControlCore` 发送一次零速度设定并同步核心状态。固件侧运动 TTL 与看门狗仍然是独立的物理兜底；上位机不承担看门狗职责。
+- 控制租约默认 30 s（`INTERACTIVE_LEASE_S`），任意成功命令都会续租。正常操控期间控制权持续保持；只有超过 30 s 完全无按键输入才触发 `COMMAND_TIMEOUT` 安全停车并解除控制权（输入静默失败关闭）。
+- 不要把键盘重复延迟设置得接近或超过 150 ms，否则按住运动键会被推断为松键（表现为短暂停车，再按即恢复）。EOF、Ctrl-C、未处理异常、连接中断和正常退出都会进入 `ControlCore.shutdown(reason)`，尝试安全停车后关闭唯一正式串口。
+
+## 输入延迟与 I/O 切片
+
+`RescueCarClient` 以构造参数 `io_slice_s`（默认 `0.02`，独立使用行为不变）控制空闲串口读切片；工作线程在两次读切片之间才检查请求队列，因此该值也约束了排队命令的额外分发延迟。`CompetitionLinkConfig.io_slice_s` 默认 `0.005`，即正式控制链的取值。
+
+`benchmark_teleop_latency.py` 在 WSL/假串口下以相同速度设定（线速度 200 mm/s、角速度 0）对比两种切片（2026-08-14，300 样本）：
+
+| 模式 | io_slice_s | motion p50 | motion mean | motion p95 | stop p50 |
+|---|---|---|---|---|---|
+| 旧参数（main@adaae84 行为） | 0.02 | 7.5 ms | 8.6 ms | 14.8 ms | 7.4 ms |
+| 新参数 | 0.005 | 2.9 ms | 3.1 ms | 4.4 ms | 2.9 ms |
+
+运动指令键到串口帧延迟改善约 61%（p50）/ 64%（mean），远超 20% 目标；改善来自输入延迟，不来自提高速度设定（两模式速度完全相同）。`tests/test_teleop_latency.py` 在测试套件内复跑该对比并断言门槛。
+
+WSL/假串口高压流量下偶发的 `HEARTBEAT_ACK timed out` 断线属于上游 `RescueCarClient` 传输层行为（两种切片取值下都会出现，与本仓库改动无关；失败方向为 fail-closed）。心跳与看门狗语义归电控队友所有，该观察已按交接记录反馈，不在本仓库修改。
 
 ## 关键语义
 
@@ -101,10 +120,11 @@ python3 -B -m unittest -v tests.test_competition_lower_link
 python3 -B -m unittest -v tests.test_cli
 python3 -B -m unittest discover -v
 python3 -B -m rescue_control scenario all
+python3 benchmark_teleop_latency.py --samples 300
 sh -n run_teleop.sh
 git diff --check
 ```
 
-`tests.test_cli` 用 `FakeLowerLink` 覆盖全部键位、帮助、输入超时、新代际重新 ARM、EOF、Ctrl-C、异常、连接中断和正常退出；正式入口测试以注入 Fake 的方式断言 `CompetitionLowerLink` 构造路径，不会打开真实串口。
+`tests.test_cli` 用 `FakeLowerLink` 覆盖全部键位、帮助、单次 `R` 跨暂停保持控制、松键自动零速、`Space` 停车保权、`E` 安全停车解权、`U` 后运动需重新 ARM、30 s 输入静默超时、新代际重新 ARM、EOF、Ctrl-C、异常、连接中断和正常退出；正式入口测试以注入 Fake 的方式断言 `CompetitionLowerLink` 构造路径，不会打开真实串口。
 
 这些结果只证明 WSL 逻辑、Fake 后端与假串口行为。Pi 的 `/dev/serial/by-id/...` 权限和独占打开、终端按键重复节拍、正式 STM32 commit/schema、真实状态节拍、看门狗、架空车轮和实车闭环仍需分别验收。
