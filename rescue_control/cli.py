@@ -18,9 +18,11 @@ from .control_core import (
     CleanupResult,
     ControlCore,
     CoreBackendError,
+    CoreConfig,
     CoreError,
     CoreErrorCode,
     CoreMode,
+    CoreSnapshot,
     InvalidControlInput,
     LeaseToken,
 )
@@ -35,7 +37,19 @@ from .models import (
 
 
 MOTION_TTL_MS = 200
-INTERACTIVE_LEASE_S = 0.5
+# Control persists for the whole lease once R is pressed; any successful
+# command renews it, so normal operation never needs to hold or repeat R.
+# A genuine input silence longer than the lease still expires into a
+# COMMAND_TIMEOUT safety stop (fail-closed dead-man behaviour).
+INTERACTIVE_LEASE_S = 30.0
+# Entry points must allow the interactive lease inside CoreConfig limits.
+INTERACTIVE_MAX_LEASE_S = 60.0
+# A terminal delivers key repeats but no physical key-up; when motion repeats
+# stop for this long the operator is treated as having released the key and a
+# zero setpoint is sent explicitly.  The firmware motion TTL remains the
+# independent hardware fallback.
+MOTION_RELEASE_S = 0.15
+INTERACTIVE_POLL_S = 0.02
 MOTION_KEYS = {
     "w": (200, 0, "forward"),
     "s": (-200, 0, "backward"),
@@ -43,30 +57,33 @@ MOTION_KEYS = {
     "d": (0, -800, "turn_right"),
 }
 INTERACTIVE_KEY_BINDINGS = {
-    "R": "acquire control and ARM",
+    "R": "acquire control and ARM (press once)",
     "U": "DISARM",
-    "W/S/A/D": "forward/backward/left/right; repeat to refresh control",
-    "Space": "ordinary stop",
+    "W/S/A/D": "hold to move; release to stop",
+    "Space": "ordinary stop (keeps control)",
     "O/C": "open/close gripper",
-    "E": "user-requested safety stop",
+    "E": "safety stop and release control",
     "H/?": "show help and current status",
     "Q": "quit with safety cleanup",
 }
 
 INTERACTIVE_HELP_MESSAGE = (
     "Keyboard teleoperation:\n"
-    "  R       acquire control and ARM\n"
+    "  R       acquire control and ARM (press once; no need to hold)\n"
     "  U       DISARM\n"
-    "  W/S     forward/backward\n"
-    "  A/D     turn left/right\n"
-    "  Space   ordinary stop\n"
+    "  W/S     forward/backward (hold to move)\n"
+    "  A/D     turn left/right (hold to move)\n"
+    "  Space   ordinary stop (keeps control)\n"
     "  O/C     gripper OPEN/CLOSED\n"
-    "  E       safety stop\n"
+    "  E       safety stop and release control\n"
     "  H or ?  help and current status\n"
     "  Q       quit with safety cleanup\n"
-    "This terminal cannot reliably detect physical key-up. Repeat W/S/A/D to "
-    "refresh the 500 ms input timeout; when repeats stop, lease expiry causes a "
-    "safety stop. Press Space for an immediate ordinary stop."
+    "This terminal cannot reliably detect physical key-up: when W/S/A/D "
+    "repeats stop for about 150 ms a zero setpoint is sent automatically, "
+    "and the firmware motion TTL stops the motors independently. Control "
+    "persists without holding R; 30 s without any key input causes a "
+    "COMMAND_TIMEOUT safety stop and releases control. Press Space for an "
+    "immediate ordinary stop."
 )
 
 
@@ -728,6 +745,8 @@ def _emit_interactive_help(
     core: ControlCore,
     *,
     event: str,
+    lease_duration_s: float = INTERACTIVE_LEASE_S,
+    motion_release_s: float = MOTION_RELEASE_S,
 ) -> None:
     writer.emit(
         event,
@@ -736,7 +755,8 @@ def _emit_interactive_help(
         core=core,
         keys=INTERACTIVE_KEY_BINDINGS,
         reliable_key_up=False,
-        lease_timeout_ms=round(INTERACTIVE_LEASE_S * 1_000),
+        lease_timeout_ms=round(lease_duration_s * 1_000),
+        motion_release_ms=round(motion_release_s * 1_000),
         motion_ttl_ms=MOTION_TTL_MS,
         message=INTERACTIVE_HELP_MESSAGE,
     )
@@ -748,10 +768,13 @@ def run_interactive_session(
     writer: OutputWriter,
     *,
     owner: str = "interactive",
-    poll_interval_s: float = 0.05,
+    poll_interval_s: float = INTERACTIVE_POLL_S,
+    lease_duration_s: float = INTERACTIVE_LEASE_S,
+    motion_release_s: float = MOTION_RELEASE_S,
 ) -> int:
     """Run an injectable event loop; tests can provide a clock-free input source."""
     token: LeaseToken | None = None
+    last_motion_at: float | None = None
     exit_code = 0
     cause = SafeStopReason.SHUTDOWN
     entered = False
@@ -760,7 +783,13 @@ def run_interactive_session(
         writer.emit("interactive", "connect", "OK", core=core)
         source.__enter__()
         entered = True
-        _emit_interactive_help(writer, core, event="interactive_start")
+        _emit_interactive_help(
+            writer,
+            core,
+            event="interactive_start",
+            lease_duration_s=lease_duration_s,
+            motion_release_s=motion_release_s,
+        )
         while True:
             key = source.read(poll_interval_s)
             snapshot = core.poll()
@@ -778,6 +807,29 @@ def run_interactive_session(
                     message="lower-controller connection was lost",
                 )
                 break
+            if token is not None and _motion_release_due(
+                snapshot, last_motion_at, motion_release_s
+            ):
+                # Key repeats stopped: send an explicit zero setpoint instead
+                # of waiting for the firmware TTL, and resync commanded state.
+                last_motion_at = None
+                try:
+                    result = core.set_chassis(token, 0, 0, MOTION_TTL_MS)
+                    writer.emit(
+                        "auto", "RELEASE_STOP", result.status.value, core=core
+                    )
+                except CoreError as exc:
+                    if core.snapshot().lease is None:
+                        token = None
+                    writer.emit(
+                        "auto",
+                        "RELEASE_STOP",
+                        "REJECTED",
+                        core=core,
+                        error_code=exc.code.value,
+                        message=str(exc),
+                        **_core_error_details(exc),
+                    )
             if key is None:
                 continue
             if key == "":
@@ -792,9 +844,9 @@ def run_interactive_session(
                     snapshot = core.snapshot()
                     already_owned = token is not None and snapshot.lease is not None
                     if not already_owned:
-                        token = core.acquire_lease(owner, INTERACTIVE_LEASE_S)
+                        token = core.acquire_lease(owner, lease_duration_s)
                     else:
-                        core.renew_lease(token, INTERACTIVE_LEASE_S)
+                        core.renew_lease(token, lease_duration_s)
                     if already_owned and snapshot.mode is CoreMode.ARMED:
                         writer.emit("key", "ARM", "ALREADY_ARMED", core=core)
                     else:
@@ -840,6 +892,8 @@ def run_interactive_session(
                         CoreErrorCode.INVALID_INPUT,
                         "no active control; press R to acquire control and ARM",
                     )
+                if normalized in MOTION_KEYS:
+                    last_motion_at = snapshot.time_s
                 result = apply_control_key(core, token, key)
                 writer.emit(
                     "key", _key_name(key), result.status.value, core=core
@@ -955,6 +1009,22 @@ def _key_name(key: str) -> str:
     if not key:
         return "EOF"
     return key.upper()
+
+
+def _motion_release_due(
+    snapshot: CoreSnapshot,
+    last_motion_at: float | None,
+    release_s: float,
+) -> bool:
+    """Infer key release from stopped repeats while a motion setpoint is live."""
+    if last_motion_at is None:
+        return False
+    if (
+        snapshot.commanded_linear_velocity_mm_s == 0
+        and snapshot.commanded_angular_velocity_mrad_s == 0
+    ):
+        return False
+    return snapshot.time_s - last_motion_at >= release_s
 
 
 def _by_id_serial_port(value: str) -> str:
@@ -1298,7 +1368,11 @@ def main(
     if args.command == "interactive":
         clock = time.monotonic
         fake = FakeLowerLink(clock)
-        core = ControlCore(fake, clock=clock)
+        core = ControlCore(
+            fake,
+            clock=clock,
+            config=CoreConfig(max_lease_duration_s=INTERACTIVE_MAX_LEASE_S),
+        )
         writer = OutputWriter(stdout, json_mode=args.json, clock=clock)
         return run_interactive_session(
             core, TerminalInputSource(stdin), writer
@@ -1307,7 +1381,11 @@ def main(
         from .competition_lower_link import CompetitionLowerLink
 
         clock = time.monotonic
-        core = ControlCore(CompetitionLowerLink(port=args.port), clock=clock)
+        core = ControlCore(
+            CompetitionLowerLink(port=args.port),
+            clock=clock,
+            config=CoreConfig(max_lease_duration_s=INTERACTIVE_MAX_LEASE_S),
+        )
         writer = OutputWriter(stdout, json_mode=False, clock=clock)
         return run_interactive_session(
             core, TerminalInputSource(stdin), writer, owner="terminal-teleop"

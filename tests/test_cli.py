@@ -11,15 +11,20 @@ from unittest.mock import patch
 
 from rescue_control import (
     ControlCore,
+    CoreConfig,
     CoreErrorCode,
     DeliveryState,
     FakeLowerLink,
+    FaultKind,
     GripperTarget,
     ManualClock,
     SafeStopReason,
 )
 from rescue_control.cli import (
     BUILTIN_SCENARIOS,
+    INTERACTIVE_LEASE_S,
+    INTERACTIVE_MAX_LEASE_S,
+    MOTION_TTL_MS,
     OutputWriter,
     ScenarioRunner,
     apply_control_key,
@@ -31,6 +36,15 @@ from rescue_control.cli import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def make_interactive_core(fake: FakeLowerLink, clock: ManualClock) -> ControlCore:
+    """Interactive sessions use a 30 s control lease; the core must allow it."""
+    return ControlCore(
+        fake,
+        clock=clock,
+        config=CoreConfig(max_lease_duration_s=INTERACTIVE_MAX_LEASE_S),
+    )
 
 
 def parse_ndjson(stream: io.StringIO) -> list[dict[str, object]]:
@@ -315,6 +329,8 @@ class AdvancingEventSource(EventSource):
         self.clock.advance(advance_s)
         if isinstance(event, BaseException):
             raise event
+        if callable(event):
+            return event()
         return event
 
 
@@ -353,7 +369,7 @@ class InteractiveCleanupTests(unittest.TestCase):
     def run_events(self, events: list[object], *, exit_error=None):
         clock = ManualClock()
         fake = FakeLowerLink(clock)
-        core = ControlCore(fake, clock=clock)
+        core = make_interactive_core(fake, clock)
         output = io.StringIO()
         source = EventSource(events, exit_error=exit_error)
         writer = OutputWriter(output, json_mode=True, clock=clock)
@@ -405,7 +421,11 @@ class InteractiveCleanupTests(unittest.TestCase):
         self.assertEqual(len(help_records), 3)
         for record in help_records:
             self.assertFalse(record["reliable_key_up"])
-            self.assertEqual(record["lease_timeout_ms"], 500)
+            self.assertEqual(
+                record["lease_timeout_ms"], round(INTERACTIVE_LEASE_S * 1_000)
+            )
+            self.assertEqual(record["motion_release_ms"], 150)
+            self.assertEqual(record["motion_ttl_ms"], MOTION_TTL_MS)
             self.assertEqual(
                 set(record["keys"]),
                 {
@@ -444,11 +464,11 @@ class InteractiveCleanupTests(unittest.TestCase):
     def test_late_motion_key_after_deadline_cannot_reactivate(self) -> None:
         clock = ManualClock()
         fake = FakeLowerLink(clock)
-        core = ControlCore(fake, clock=clock)
+        core = make_interactive_core(fake, clock)
         output = io.StringIO()
         source = AdvancingEventSource(
             clock,
-            [(0, "R"), (0, "W"), (0.5, "W"), (0, "Q")],
+            [(0, "R"), (0, "W"), (INTERACTIVE_LEASE_S, "W"), (0, "Q")],
         )
         writer = OutputWriter(output, json_mode=True, clock=clock)
         code = run_interactive_session(core, source, writer)
@@ -475,15 +495,24 @@ class InteractiveCleanupTests(unittest.TestCase):
     def test_motion_repeat_refreshes_lease_without_a_management_key(self) -> None:
         clock = ManualClock()
         fake = FakeLowerLink(clock)
-        core = ControlCore(fake, clock=clock)
+        core = make_interactive_core(fake, clock)
         output = io.StringIO()
+        # Realistic 30 Hz key repeats: gaps stay below the 150 ms release
+        # threshold, so no automatic zero setpoint may interleave, and the
+        # lease must survive far beyond the old 500 ms timeout.
+        repeats = [(0.03, "W") for _ in range(20)]
         source = AdvancingEventSource(
             clock,
-            [(0, "R"), (0, "W"), (0.49, "W"), (0.49, "W"), (0, "Q")],
+            [(0, "R"), (0, "W"), *repeats, (0, "Q")],
         )
         writer = OutputWriter(output, json_mode=True, clock=clock)
         self.assertEqual(run_interactive_session(core, source, writer), 0)
-        self.assertEqual(fake.count("set_chassis"), 3)
+        self.assertEqual(fake.count("set_chassis"), 21)
+        self.assertEqual(fake.count("arm"), 1)
+        records = parse_ndjson(output)
+        self.assertEqual(
+            [r for r in records if r["action"] == "RELEASE_STOP"], []
+        )
         timeout_events = [
             event
             for event in core.events
@@ -495,11 +524,11 @@ class InteractiveCleanupTests(unittest.TestCase):
     def test_r_after_timeout_uses_new_authority_without_replaying_motion(self) -> None:
         clock = ManualClock()
         fake = FakeLowerLink(clock)
-        core = ControlCore(fake, clock=clock)
+        core = make_interactive_core(fake, clock)
         output = io.StringIO()
         source = AdvancingEventSource(
             clock,
-            [(0, "R"), (0, "W"), (0.5, None), (0, "R"), (0, "Q")],
+            [(0, "R"), (0, "W"), (INTERACTIVE_LEASE_S, None), (0, "R"), (0, "Q")],
         )
         writer = OutputWriter(output, json_mode=True, clock=clock)
         self.assertEqual(run_interactive_session(core, source, writer), 0)
@@ -516,10 +545,250 @@ class InteractiveCleanupTests(unittest.TestCase):
             arm_records[0]["lease_generation"],
         )
 
+    def test_single_r_holds_control_across_operator_pauses(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        # Pauses of 5 s between inputs far exceed the old 500 ms lease; one
+        # R press must keep control and ARM through the whole session.
+        source = AdvancingEventSource(
+            clock,
+            [
+                (0, "R"), (0, "W"), (5.0, "W"), (5.0, " "),
+                (5.0, "S"), (5.0, "o"), (0, "Q"),
+            ],
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 0)
+        self.assertEqual(fake.count("arm"), 1)
+        self.assertEqual(fake.count("safe_stop"), 1)  # final cleanup only
+        records = parse_ndjson(output)
+        key_records = [r for r in records if r["event"] == "key"]
+        # DEDUPLICATED is the success outcome of Space right after the
+        # automatic release already zeroed the setpoint.
+        self.assertTrue(
+            all(
+                r["outcome"] in ("COMPLETED", "DEDUPLICATED")
+                for r in key_records
+            ),
+            key_records,
+        )
+        generations = {
+            r["lease_generation"]
+            for r in key_records
+            if r["lease_generation"] is not None
+        }
+        self.assertEqual(len(generations), 1)
+        timeout_events = [
+            event
+            for event in core.events
+            if event.event == "safe_stop"
+            and dict(event.details).get("reason") == "COMMAND_TIMEOUT"
+        ]
+        self.assertEqual(timeout_events, [])
+
+    def test_key_release_sends_zero_setpoint_and_keeps_control(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        source = AdvancingEventSource(
+            clock,
+            [(0, "R"), (0, "W"), (0.2, None), (0, "S"), (0, "Q")],
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 0)
+        chassis = [
+            dict(record.parameters)
+            for record in fake.history
+            if record.operation == "set_chassis"
+        ]
+        self.assertEqual(
+            [
+                (p["linear_velocity_mm_s"], p["angular_velocity_mrad_s"])
+                for p in chassis
+            ],
+            [(200, 0), (0, 0), (-200, 0)],
+        )
+        records = parse_ndjson(output)
+        release = [
+            r for r in records if r["action"] == "RELEASE_STOP"
+        ]
+        self.assertEqual([r["outcome"] for r in release], ["COMPLETED"])
+        # Control and ARM survive a release; motion resumes without R.
+        self.assertEqual(fake.count("arm"), 1)
+        self.assertEqual(fake.count("stop"), 0)
+        self.assertEqual(fake.count("safe_stop"), 1)  # final cleanup only
+        resume = [
+            r for r in records if r["event"] == "key" and r["action"] == "S"
+        ]
+        self.assertEqual([r["outcome"] for r in resume], ["COMPLETED"])
+
+    def test_no_release_zero_when_already_stopped_by_space(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        source = AdvancingEventSource(
+            clock,
+            [(0, "R"), (0, "W"), (0, " "), (0.5, None), (0, "Q")],
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 0)
+        self.assertEqual(fake.count("set_chassis"), 1)
+        self.assertEqual(fake.count("stop"), 1)
+        self.assertEqual(
+            [
+                r
+                for r in parse_ndjson(output)
+                if r["action"] == "RELEASE_STOP"
+            ],
+            [],
+        )
+
+    def test_space_stop_keeps_control_and_motion_resumes_without_r(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        source = AdvancingEventSource(
+            clock,
+            [(0, "R"), (0, "W"), (0, " "), (0, "S"), (0, "Q")],
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 0)
+        self.assertEqual(fake.count("arm"), 1)
+        self.assertEqual(fake.count("stop"), 1)
+        records = parse_ndjson(output)
+        space = next(
+            r for r in records if r["event"] == "key" and r["action"] == "SPACE"
+        )
+        self.assertEqual(space["outcome"], "COMPLETED")
+        self.assertEqual(space["core_mode"], "ARMED")
+        self.assertIsNotNone(space["lease_generation"])
+        resume = [
+            r for r in records if r["event"] == "key" and r["action"] == "S"
+        ]
+        self.assertEqual([r["outcome"] for r in resume], ["COMPLETED"])
+
+    def test_e_safe_stop_releases_control_and_r_recovers(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        source = AdvancingEventSource(
+            clock,
+            [(0, "R"), (0, "W"), (0, "E"), (0, "W"), (0, "R"), (0, "W"), (0, "Q")],
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 0)
+        records = parse_ndjson(output)
+        safe_stop = next(
+            r for r in records if r["action"] == "SAFE_STOP"
+        )
+        self.assertEqual(safe_stop["safety_reason"], "USER_REQUEST")
+        self.assertIsNone(safe_stop["lease_generation"])
+        motion = [
+            r for r in records if r["event"] == "key" and r["action"] == "W"
+        ]
+        self.assertEqual(
+            [r["outcome"] for r in motion],
+            ["COMPLETED", "REJECTED", "COMPLETED"],
+        )
+        self.assertEqual(
+            motion[1]["error_code"], CoreErrorCode.INVALID_INPUT.value
+        )
+        self.assertGreater(
+            motion[2]["lease_generation"], motion[0]["lease_generation"]
+        )
+
+    def test_disarm_keeps_lease_but_motion_requires_rearm(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        source = AdvancingEventSource(
+            clock,
+            [(0, "R"), (0, "U"), (0, "W"), (0, "Q")],
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 0)
+        self.assertEqual(fake.count("disarm"), 1)
+        self.assertEqual(fake.count("set_chassis"), 0)
+        self.assertEqual(fake.count("safe_stop"), 1)  # final cleanup only
+        motion = [
+            r
+            for r in parse_ndjson(output)
+            if r["event"] == "key" and r["action"] == "W"
+        ]
+        self.assertEqual([r["outcome"] for r in motion], ["REJECTED"])
+        self.assertEqual(
+            motion[0]["error_code"], CoreErrorCode.INVALID_STATE.value
+        )
+
+    def test_input_silence_still_expires_into_command_timeout(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        source = AdvancingEventSource(
+            clock,
+            [(0, "R"), (0, "W"), (INTERACTIVE_LEASE_S, None), (0, "Q")],
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 0)
+        self.assertGreaterEqual(fake.count("safe_stop"), 1)
+        timeout_events = [
+            event
+            for event in core.events
+            if event.event == "lease_expired"
+        ]
+        self.assertEqual(len(timeout_events), 1)
+        records = parse_ndjson(output)
+        self.assertEqual(records[-1]["safety_reason"], "SHUTDOWN")
+        cleanup = next(r for r in records if r["event"] == "cleanup")
+        self.assertEqual(cleanup["outcome"], "OK")
+
+    def test_release_stop_failure_is_fail_closed(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        source = AdvancingEventSource(
+            clock,
+            [
+                (0, "R"),
+                (0, "W"),
+                (
+                    0,
+                    lambda: (
+                        fake.fail_next(
+                            "set_chassis", FaultKind.TIMEOUT_AFTER_EFFECT
+                        ),
+                        None,
+                    )[1],
+                ),
+                (0.2, None),
+                (0, "Q"),
+            ],
+        )
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        self.assertEqual(run_interactive_session(core, source, writer), 0)
+        records = parse_ndjson(output)
+        release = [
+            r for r in records if r["action"] == "RELEASE_STOP"
+        ]
+        self.assertEqual([r["outcome"] for r in release], ["REJECTED"])
+        self.assertEqual(release[0]["error_code"], "BACKEND_TIMEOUT")
+        self.assertEqual(release[0]["safety_reason"], "BACKEND_FAILURE")
+        self.assertIsNone(core.snapshot().lease)
+        self.assertGreaterEqual(fake.count("safe_stop"), 1)
+
     def test_link_disconnect_terminates_and_runs_cleanup(self) -> None:
         clock = ManualClock()
         fake = FakeLowerLink(clock)
-        core = ControlCore(fake, clock=clock)
+        core = make_interactive_core(fake, clock)
         output = io.StringIO()
         source = EventSource(
             ["R", "W", lambda: (fake.inject_disconnect(), None)[1]]
