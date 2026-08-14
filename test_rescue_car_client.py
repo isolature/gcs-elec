@@ -33,8 +33,8 @@ def _signed_field(number, value):
 
 
 class FakeStm32Serial:
-    def __init__(self, **_kwargs):
-        self.timeout = 0.02
+    def __init__(self, timeout=None, **_kwargs):
+        self.timeout = 0.02 if timeout is None else timeout
         self.is_open = True
         self.received = []
         self._rx = bytearray()
@@ -338,6 +338,54 @@ class RescueCarClientTests(unittest.TestCase):
         instance = FakeStm32Serial(**kwargs)
         self.serials.append(instance)
         return instance
+
+
+class IoSliceConfigTests(unittest.TestCase):
+    def test_default_slice_preserves_legacy_serial_timeout(self):
+        serials = []
+
+        def factory(**kwargs):
+            instance = FakeStm32Serial(**kwargs)
+            serials.append(instance)
+            return instance
+
+        client = RescueCarClient(
+            port="FAKE", serial_factory=factory, reconnect=False
+        ).connect()
+        try:
+            self.assertEqual(serials[0].timeout, 0.02)
+        finally:
+            client.close(stop=False)
+
+    def test_configured_slice_reaches_serial_timeout(self):
+        serials = []
+
+        def factory(**kwargs):
+            instance = FakeStm32Serial(**kwargs)
+            serials.append(instance)
+            return instance
+
+        client = RescueCarClient(
+            port="FAKE",
+            serial_factory=factory,
+            reconnect=False,
+            io_slice_s=0.005,
+        ).connect()
+        try:
+            self.assertEqual(serials[0].timeout, 0.005)
+        finally:
+            client.close(stop=False)
+
+    def test_invalid_slice_values_are_rejected(self):
+        for bad in (0, -0.01, 0.2, float("nan"), float("inf"), True, "0.01"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    RescueCarClient(
+                        port="FAKE",
+                        serial_factory=lambda **kwargs: FakeStm32Serial(**kwargs),
+                        reconnect=False,
+                        io_slice_s=bad,
+                    )
 
 
 class FormalControlIntegrationTests(unittest.TestCase):

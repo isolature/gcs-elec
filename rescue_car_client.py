@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 import glob
+import math
 import os
 import queue
 import secrets
@@ -20,6 +21,12 @@ DEFAULT_MOTION_TTL_MS = 300
 DEFAULT_LINEAR_SPEED_MM_S = 150
 DEFAULT_TURN_RATE_MRAD_S = 1000
 RECONNECT_DELAY_S = 0.25
+# Upper bound of one idle serial-read slice.  The worker checks the request
+# queue only between slices, so this also bounds the extra dispatch latency a
+# queued command can see while the link is idle.
+DEFAULT_IO_SLICE_S = 0.02
+MIN_IO_SLICE_S = 0.001
+MAX_IO_SLICE_S = 0.1
 
 
 class RescueCarError(RuntimeError):
@@ -103,12 +110,24 @@ class RescueCarClient:
         baudrate=BAUDRATE,
         serial_factory=None,
         reconnect=True,
+        io_slice_s=DEFAULT_IO_SLICE_S,
     ):
         protocol.self_check()
+        if (
+            isinstance(io_slice_s, bool)
+            or not isinstance(io_slice_s, (int, float))
+            or not math.isfinite(io_slice_s)
+            or not MIN_IO_SLICE_S <= io_slice_s <= MAX_IO_SLICE_S
+        ):
+            raise ValueError(
+                f"io_slice_s must be a finite number in "
+                f"[{MIN_IO_SLICE_S}, {MAX_IO_SLICE_S}]"
+            )
         self._configured_port = port
         self._baudrate = baudrate
         self._serial_factory = serial_factory
         self._reconnect = reconnect
+        self._io_slice_s = float(io_slice_s)
 
         self._lock = threading.Lock()
         self._state_changed = threading.Condition(self._lock)
@@ -333,13 +352,15 @@ class RescueCarClient:
     def _make_serial(self, port):
         if self._serial_factory is not None:
             return self._serial_factory(
-                port=port, baudrate=self._baudrate, timeout=0.02
+                port=port, baudrate=self._baudrate, timeout=self._io_slice_s
             )
         try:
             import serial
         except ImportError as exc:
             raise RescueCarError("pyserial is required: pip install pyserial") from exc
-        return serial.Serial(port=port, baudrate=self._baudrate, timeout=0.02)
+        return serial.Serial(
+            port=port, baudrate=self._baudrate, timeout=self._io_slice_s
+        )
 
     def _open_and_handshake(self):
         port = self._configured_port or find_stm32()
@@ -503,7 +524,7 @@ class RescueCarClient:
             raise OSError(f"short serial write: {written}/{len(wire)}")
 
     def _read_available(self):
-        deadline = time.monotonic() + 0.02
+        deadline = time.monotonic() + self._io_slice_s
         frame = self._read_frame(deadline)
         if frame is not None:
             self._handle_frame(frame)

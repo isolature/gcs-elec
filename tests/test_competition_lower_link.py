@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 import rescue_car_client as runtime
 import rescue_car_protocol as protocol
@@ -398,6 +399,41 @@ class CompetitionLowerLinkTests(unittest.TestCase):
         self.link.close()
         self.assertEqual(self.client.calls[-1], ("close", False))
         self.assertFalse(any(call == ("safe_stop",) for call in self.client.calls))
+
+
+class IoSliceWiringTests(unittest.TestCase):
+    def test_adapter_constructs_client_with_configured_io_slice(self):
+        constructed = []
+
+        class RecordingClient(FakeRuntimeClient):
+            def __init__(self, **kwargs):
+                super().__init__(ManualClock(2.0))
+                constructed.append(kwargs)
+
+        with patch(
+            "rescue_control.competition_lower_link.runtime.RescueCarClient",
+            RecordingClient,
+        ):
+            CompetitionLowerLink(port="/dev/serial/by-id/usb-STM32-test")
+            CompetitionLowerLink(
+                port="/dev/serial/by-id/usb-STM32-test",
+                config=CompetitionLinkConfig(io_slice_s=0.02),
+            )
+        self.assertEqual(constructed[0]["io_slice_s"], 0.005)
+        self.assertEqual(constructed[1]["io_slice_s"], 0.02)
+
+    def test_injected_client_ignores_io_slice_and_invalid_values_fail(self):
+        clock = ManualClock(2.0)
+        link = CompetitionLowerLink(
+            client=FakeRuntimeClient(clock),
+            clock=clock,
+            config=CompetitionLinkConfig(io_slice_s=0.001),
+        )
+        self.assertIsNotNone(link)
+        for bad in (0.0, -1.0, float("nan")):
+            with self.subTest(bad=bad):
+                with self.assertRaises((TypeError, ValueError)):
+                    CompetitionLinkConfig(io_slice_s=bad)
 
 
 if __name__ == "__main__":

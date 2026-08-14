@@ -35,6 +35,10 @@ class CompetitionLinkConfig:
     initial_feedback_timeout_s: float = 1.0
     confirmation_timeout_s: float = 0.25
     feedback_stale_after_s: float = 0.5
+    # Idle serial-read slice of the runtime client; bounds how long a queued
+    # command can wait behind an idle read before it is dispatched.  Only
+    # applied when this adapter constructs the client itself.
+    io_slice_s: float = 0.005
 
     def __post_init__(self) -> None:
         for name, value in vars(self).items():
@@ -64,15 +68,18 @@ class CompetitionLowerLink:
     ) -> None:
         if client is not None and (port is not None or serial_factory is not None):
             raise ValueError("an injected client cannot be combined with port options")
+        self._config = config or CompetitionLinkConfig()
         self._client = (
             client
             if client is not None
             else runtime.RescueCarClient(
-                port=port, serial_factory=serial_factory, reconnect=reconnect
+                port=port,
+                serial_factory=serial_factory,
+                reconnect=reconnect,
+                io_slice_s=self._config.io_slice_s,
             )
         )
         self._clock = clock
-        self._config = config or CompetitionLinkConfig()
         self._authority: tuple[int, int, int] | None = None
         self._last_safe_stop_reason: SafeStopReason | None = None
 
