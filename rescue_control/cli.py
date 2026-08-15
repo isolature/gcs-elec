@@ -26,6 +26,12 @@ from .control_core import (
     InvalidControlInput,
     LeaseToken,
 )
+from .capture import (
+    CaptureApp,
+    CaptureEventKind,
+    TeleopCameraSession,
+    build_camera_app,
+)
 from .fake_lower_link import FakeLowerLink, FaultKind, ManualClock
 from .models import (
     CommandStatus,
@@ -62,6 +68,7 @@ INTERACTIVE_KEY_BINDINGS = {
     "W/S/A/D": "hold to move; release to stop",
     "Space": "ordinary stop (keeps control)",
     "O/C": "open/close gripper",
+    "P/V": "photo / video record toggle (camera session)",
     "E": "safety stop and release control",
     "H/?": "show help and current status",
     "Q": "quit with safety cleanup",
@@ -75,6 +82,8 @@ INTERACTIVE_HELP_MESSAGE = (
     "  A/D     turn left/right (hold to move)\n"
     "  Space   ordinary stop (keeps control)\n"
     "  O/C     gripper OPEN/CLOSED\n"
+    "  P       photo pair (far+near); rejected while recording\n"
+    "  V       video record start/stop (dual camera)\n"
     "  E       safety stop and release control\n"
     "  H or ?  help and current status\n"
     "  Q       quit with safety cleanup\n"
@@ -83,7 +92,11 @@ INTERACTIVE_HELP_MESSAGE = (
     "and the firmware motion TTL stops the motors independently. Control "
     "persists without holding R; 30 s without any key input causes a "
     "COMMAND_TIMEOUT safety stop and releases control. Press Space for an "
-    "immediate ordinary stop."
+    "immediate ordinary stop.\n"
+    "P/V need a camera session (--camera-map); photos and videos run on a "
+    "separate camera thread and never block driving. The session is "
+    "finalized on exit; run the existing inventory/transfer pipeline "
+    "afterwards, not during teleop."
 )
 
 
@@ -762,6 +775,50 @@ def _emit_interactive_help(
     )
 
 
+def _emit_camera_events(
+    writer: OutputWriter,
+    core: ControlCore,
+    events: list,
+) -> None:
+    """Render worker notifications as NDJSON; called on the loop thread."""
+    for event in events:
+        details: dict[str, object] = {
+            "camera_event": event.kind.value,
+            "session_id": event.session_id,
+            "session_dir": event.session_dir,
+        }
+        if event.action:
+            details["camera_action"] = event.action
+        if event.kind is CaptureEventKind.READY:
+            outcome = "READY"
+        elif event.kind is CaptureEventKind.KEY_RESULT:
+            detail = event.detail or ""
+            if detail.startswith("error:"):
+                outcome = "ERROR"
+                details["message"] = detail
+            elif detail in ("photo_rejected", "debounced", "ignored"):
+                outcome = "REJECTED"
+                details["message"] = detail
+            else:
+                outcome = "COMPLETED"
+                details["message"] = detail
+        elif event.kind is CaptureEventKind.POLL_ERROR:
+            outcome = "ERROR"
+            details["message"] = event.detail
+        elif event.kind is CaptureEventKind.CLOSED:
+            outcome = "OK" if not event.detail else "ERROR"
+            details["message"] = (
+                "camera session finalized; run the inventory/transfer "
+                "pipeline after teleop"
+                if not event.detail
+                else event.detail
+            )
+        else:  # CaptureEventKind.UNAVAILABLE
+            outcome = "ERROR"
+            details["message"] = event.detail
+        writer.emit("capture", event.kind.value, outcome, core=core, **details)
+
+
 def run_interactive_session(
     core: ControlCore,
     source,
@@ -771,6 +828,7 @@ def run_interactive_session(
     poll_interval_s: float = INTERACTIVE_POLL_S,
     lease_duration_s: float = INTERACTIVE_LEASE_S,
     motion_release_s: float = MOTION_RELEASE_S,
+    camera: TeleopCameraSession | None = None,
 ) -> int:
     """Run an injectable event loop; tests can provide a clock-free input source."""
     token: LeaseToken | None = None
@@ -790,9 +848,13 @@ def run_interactive_session(
             lease_duration_s=lease_duration_s,
             motion_release_s=motion_release_s,
         )
+        if camera is not None:
+            camera.start()
         while True:
             key = source.read(poll_interval_s)
             snapshot = core.poll()
+            if camera is not None:
+                _emit_camera_events(writer, core, camera.drain_events())
             if snapshot.lease is None:
                 token = None
             if not snapshot.connected:
@@ -854,6 +916,61 @@ def run_interactive_session(
                         writer.emit(
                             "key", "ARM", result.status.value, core=core
                         )
+                    continue
+                if normalized in ("p", "v"):
+                    action_name = "PHOTO" if normalized == "p" else "VIDEO"
+                    if camera is None:
+                        writer.emit(
+                            "key",
+                            action_name,
+                            "SKIPPED",
+                            core=core,
+                            error_code="CAMERA_NOT_ENABLED",
+                            message=(
+                                "camera session not enabled; "
+                                "start teleop with --camera-map"
+                            ),
+                        )
+                    elif camera.busy:
+                        writer.emit(
+                            "key",
+                            action_name,
+                            "BUSY",
+                            core=core,
+                            error_code="CAMERA_BUSY",
+                            message="camera thread is still working",
+                        )
+                    else:
+                        accepted = (
+                            camera.photo()
+                            if normalized == "p"
+                            else camera.video_toggle()
+                        )
+                        if accepted:
+                            writer.emit(
+                                "key", action_name, "ACCEPTED", core=core
+                            )
+                        elif camera.closed:
+                            writer.emit(
+                                "key",
+                                action_name,
+                                "UNAVAILABLE",
+                                core=core,
+                                error_code="CAMERA_SESSION_CLOSED",
+                                message=(
+                                    "camera session is not running "
+                                    "(init failed or already finalized)"
+                                ),
+                            )
+                        else:
+                            writer.emit(
+                                "key",
+                                action_name,
+                                "BUSY",
+                                core=core,
+                                error_code="CAMERA_BUSY",
+                                message="camera thread is still working",
+                            )
                     continue
                 if normalized == "u":
                     if token is None:
@@ -950,6 +1067,28 @@ def run_interactive_session(
     finally:
         cleanup = None
         cleanup_error: Exception | None = None
+        if camera is not None:
+            try:
+                joined = camera.close(timeout_s=10.0)
+                _emit_camera_events(writer, core, camera.drain_events())
+                if not joined:
+                    writer.emit(
+                        "capture",
+                        "CAMERA_CLOSE_TIMEOUT",
+                        "ERROR",
+                        core=core,
+                        error_code="CAMERA_CLOSE_TIMEOUT",
+                        message="camera worker did not join in time",
+                    )
+            except Exception as exc:
+                writer.emit(
+                    "capture",
+                    "CAMERA_CLOSE_ERROR",
+                    "ERROR",
+                    core=core,
+                    error_code="CAMERA_CLOSE_ERROR",
+                    message=f"{type(exc).__name__}: {exc}",
+                )
         try:
             try:
                 cleanup = core.shutdown(cause)
@@ -1318,6 +1457,34 @@ def run_builtin_scenarios(
     return 0 if failures == 0 else 3
 
 
+def _add_camera_arguments(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument(
+        "--camera-map",
+        metavar="PATH",
+        help=(
+            "enable P/V photo & video keys by bridging the "
+            "rescue_camera_capture session (camera fingerprint map file)"
+        ),
+    )
+    subparser.add_argument(
+        "--capture-root",
+        metavar="DIR",
+        help="capture output root override (default: rescue_camera_capture default)",
+    )
+
+
+def _build_camera_session(args: argparse.Namespace) -> TeleopCameraSession | None:
+    camera_map = getattr(args, "camera_map", None)
+    if not camera_map:
+        return None
+    capture_root = getattr(args, "capture_root", None)
+
+    def factory() -> CaptureApp:
+        return build_camera_app(camera_map, capture_root)
+
+    return TeleopCameraSession(factory)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 -m rescue_control",
@@ -1329,6 +1496,7 @@ def build_parser() -> argparse.ArgumentParser:
         "interactive", help="Fake backend, deadman-pulse keyboard rehearsal"
     )
     interactive.add_argument("--json", action="store_true", help="emit NDJSON")
+    _add_camera_arguments(interactive)
 
     teleop = subparsers.add_parser(
         "teleop", help="control the formal lower link from a Pi terminal"
@@ -1340,6 +1508,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="/dev/serial/by-id/...",
         help="exact stable STM32 serial path; /dev/ttyACM0 is not accepted",
     )
+    _add_camera_arguments(teleop)
 
     script = subparsers.add_parser(
         "script", help="run a deterministic scenario DSL file"
@@ -1375,7 +1544,10 @@ def main(
         )
         writer = OutputWriter(stdout, json_mode=args.json, clock=clock)
         return run_interactive_session(
-            core, TerminalInputSource(stdin), writer
+            core,
+            TerminalInputSource(stdin),
+            writer,
+            camera=_build_camera_session(args),
         )
     if args.command == "teleop":
         from .competition_lower_link import CompetitionLowerLink
@@ -1388,7 +1560,11 @@ def main(
         )
         writer = OutputWriter(stdout, json_mode=False, clock=clock)
         return run_interactive_session(
-            core, TerminalInputSource(stdin), writer, owner="terminal-teleop"
+            core,
+            TerminalInputSource(stdin),
+            writer,
+            owner="terminal-teleop",
+            camera=_build_camera_session(args),
         )
     if args.command == "script":
         clock = ManualClock()

@@ -73,6 +73,8 @@ python3 -m rescue_control teleop --port /dev/serial/by-id/<exact-device-name>
 - `W` / `S` / `A` / `D`：前进、后退、左转、右转；按住持续运动（依赖系统按键重复，约 25–30 Hz）。
 - `Space`：普通停车，保留控制权和 ARM；随后可直接继续运动键。
 - `O` / `C`：夹爪张开、合拢。
+- `P`：双相机拍照（far+near 成对）；录像进行中会被状态机拒绝并记录事件。拍照不需要控制权。
+- `V`：双路录像开/关。不需要控制权。
 - `E`：安全停车并解除控制权；`R` 重新取权。
 - `H` 或 `?`：显示帮助和当前 `ControlCore` 状态。
 - `Q`：执行安全清理并退出。
@@ -83,7 +85,48 @@ python3 -m rescue_control teleop --port /dev/serial/by-id/<exact-device-name>
 - 控制租约默认 30 s（`INTERACTIVE_LEASE_S`），任意成功命令都会续租。正常操控期间控制权持续保持；只有超过 30 s 完全无按键输入才触发 `COMMAND_TIMEOUT` 安全停车并解除控制权（输入静默失败关闭）。
 - 不要把键盘重复延迟设置得接近或超过 150 ms，否则按住运动键会被推断为松键（表现为短暂停车，再按即恢复）。EOF、Ctrl-C、未处理异常、连接中断和正常退出都会进入 `ControlCore.shutdown(reason)`，尝试安全停车后关闭唯一正式串口。
 
+## 遥控中拍照与录像（P/V）
+
+`P`（拍照）和 `V`（录像开关）把遥控会话桥接到主仓库的 `rescue_camera_capture` 采集子项目，不复制其逻辑：状态机（录像中拒拍）、双路录像回滚、session 存储、清单与回传全部仍归采集子项目所有。
+
+架构与边界（`rescue_control/capture.py`）：
+
+- 相机应用独占运行在一个专用工作线程上（与采集子项目自身的单线程拥有模型一致）；控制循环只投递动作和收取事件，永不阻塞，也永不因拍照/录像失败触发安全停车。相机线程异常只产生 `capture` NDJSON 事件。
+- `P`/`V` 不需要控制权（`R`/租约与相机完全解耦）；相机路径零串口接触。
+- 会话结束时（`Q`、EOF、Ctrl-C、断连、异常）自动先停录像、关相机、终结 session 并在 NDJSON 汇报 `session_id`/`session_dir`；数据回传（清单、断点续传、核验）是退出遥控后由笔记本执行的独立步骤，不在遥控会话内进行。
+- 相机是独占设备：遥控相机会话期间不能同时运行交互式 `rescue_camera_capture` 终端程序；反之亦然。
+
+启用方式（Pi）：用采集 venv 的解释器启动遥控，使 `rescue_camera_capture` 可导入（venv 以 `--system-site-packages` 建立，pyserial 等系统包仍可用）：
+
+```bash
+cd /home/gcs/gcs-elec
+~/gcs-camera-capture/.venv/bin/python -m rescue_control teleop \
+  --port /dev/serial/by-id/usb-STMicroelectronics_STM32_Virtual_ComPort_348935793135-if00 \
+  --camera-map /home/gcs/gcs-camera-capture/config/camera_map.local.json
+```
+
+`--camera-map` 启用 P/V；`--capture-root DIR` 可覆盖输出根目录（默认沿用采集子项目的 `~/gcs-data` 约定）。不传 `--camera-map` 时 P/V 明确报告 `CAMERA_NOT_ENABLED`，遥控不受影响。包缺失或相机初始化失败只产生 `capture/UNAVAILABLE` 事件，之后 P/V 报告 `CAMERA_SESSION_CLOSED`，驾驶继续。
+
+NDJSON 事件：`capture/READY`（含 session 身份）、`key/PHOTO|VIDEO ACCEPTED|BUSY|SKIPPED|UNAVAILABLE`、`capture/KEY_RESULT`（`photo_captured`/`recording_started`/`recording_stopped`/`photo_rejected`/`debounced` 或 `error: ...`）、`capture/POLL_ERROR`、`capture/CLOSED`（含 session_id/session_dir 与回传提示）。
+
+WSL 证据边界：以上桥接行为由注入 Fake 相机应用的单元与集成测试覆盖（线程、忙碌、失败隔离、退出收尾）；真实双相机拍照/录像的遥控中验收须在 Pi 上执行（相机已于 2026-08-15 由操作者现场确认安装并完成非遥控模式验收）。
+
 ## 输入延迟与 I/O 切片
+
+`RescueCarClient` 以构造参数 `io_slice_s`（默认 `0.02`，独立使用行为不变）控制空闲串口读切片；工作线程在两次读切片之间才检查请求队列，因此该值也约束了排队命令的额外分发延迟。`CompetitionLinkConfig.io_slice_s` 默认 `0.005`，即正式控制链的取值。
+
+`benchmark_teleop_latency.py` 在 WSL/假串口下以相同速度设定（线速度 200 mm/s、角速度 0）对比两种切片（2026-08-14，300 样本）：
+
+| 模式 | io_slice_s | motion p50 | motion mean | motion p95 | stop p50 |
+|---|---|---|---|---|---|
+| 旧参数（main@adaae84 行为） | 0.02 | 7.5 ms | 8.6 ms | 14.8 ms | 7.4 ms |
+| 新参数 | 0.005 | 2.9 ms | 3.1 ms | 4.4 ms | 2.9 ms |
+
+运动指令键到串口帧延迟改善约 61%（p50）/ 64%（mean），远超 20% 目标；改善来自输入延迟，不来自提高速度设定（两模式速度完全相同）。`tests/test_teleop_latency.py` 在测试套件内复跑该对比并断言门槛。
+
+WSL/假串口高压流量下偶发的 `HEARTBEAT_ACK timed out` 断线属于上游 `RescueCarClient` 传输层行为（两种切片取值下都会出现，与本仓库改动无关；失败方向为 fail-closed）。心跳与看门狗语义归电控队友所有，该观察已按交接记录反馈，不在本仓库修改。
+
+
 
 `RescueCarClient` 以构造参数 `io_slice_s`（默认 `0.02`，独立使用行为不变）控制空闲串口读切片；工作线程在两次读切片之间才检查请求队列，因此该值也约束了排队命令的额外分发延迟。`CompetitionLinkConfig.io_slice_s` 默认 `0.005`，即正式控制链的取值。
 
@@ -118,6 +161,7 @@ WSL/假串口高压流量下偶发的 `HEARTBEAT_ACK timed out` 断线属于上�
 python3 -B -m unittest -v test_rescue_car_client.py
 python3 -B -m unittest -v tests.test_competition_lower_link
 python3 -B -m unittest -v tests.test_cli
+python3 -B -m unittest -v tests.test_capture
 python3 -B -m unittest discover -v
 python3 -B -m rescue_control scenario all
 python3 benchmark_teleop_latency.py --samples 300
@@ -125,6 +169,6 @@ sh -n run_teleop.sh
 git diff --check
 ```
 
-`tests.test_cli` 用 `FakeLowerLink` 覆盖全部键位、帮助、单次 `R` 跨暂停保持控制、松键自动零速、`Space` 停车保权、`E` 安全停车解权、`U` 后运动需重新 ARM、30 s 输入静默超时、新代际重新 ARM、EOF、Ctrl-C、异常、连接中断和正常退出；正式入口测试以注入 Fake 的方式断言 `CompetitionLowerLink` 构造路径，不会打开真实串口。
+`tests.test_cli` 用 `FakeLowerLink` 覆盖全部键位、帮助、单次 `R` 跨暂停保持控制、松键自动零速、`Space` 停车保权、`E` 安全停车解权、`U` 后运动需重新 ARM、30 s 输入静默超时、新代际重新 ARM、EOF、Ctrl-C、异常、连接中断和正常退出；正式入口测试以注入 Fake 的方式断言 `CompetitionLowerLink` 构造路径，不会打开真实串口。`tests.test_capture` 与 `tests.test_cli` 的相机会话测试注入 Fake 相机应用，覆盖运动中拍照/录像、忙碌丢弃、初始化失败降级、异常隔离和退出收尾；全部自动化测试都不打开真实相机或串口。
 
 这些结果只证明 WSL 逻辑、Fake 后端与假串口行为。Pi 的 `/dev/serial/by-id/...` 权限和独占打开、终端按键重复节拍、正式 STM32 commit/schema、真实状态节拍、看门狗、架空车轮和实车闭环仍需分别验收。

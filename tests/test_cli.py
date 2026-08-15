@@ -429,7 +429,8 @@ class InteractiveCleanupTests(unittest.TestCase):
             self.assertEqual(
                 set(record["keys"]),
                 {
-                    "R", "U", "W/S/A/D", "Space", "O/C", "E", "H/?", "Q",
+                    "R", "U", "W/S/A/D", "Space", "O/C", "P/V", "E",
+                    "H/?", "Q",
                 },
             )
             self.assertIn("cannot reliably detect physical key-up", record["message"])
@@ -943,6 +944,236 @@ class TeleopEntryTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 2)
         self.assertIn("--port /dev/serial/by-id/", completed.stderr)
+
+
+class CameraSessionIntegrationTests(unittest.TestCase):
+    """P/V keys drive the camera bridge without touching driving safety."""
+
+    def run_with_camera(
+        self,
+        events: list[object],
+        app,
+    ):
+        import time as _time
+
+        from rescue_control.capture import TeleopCameraSession
+
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        source = EventSource(events)
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        session = TeleopCameraSession(lambda: app)
+
+        def wait_busy():
+            deadline = _time.monotonic() + 5.0
+            while not session.busy and _time.monotonic() < deadline:
+                _time.sleep(0.005)
+            return "p"
+
+        def release_then_video():
+            app.gate.set()
+            deadline = _time.monotonic() + 5.0
+            while session.busy and _time.monotonic() < deadline:
+                _time.sleep(0.005)
+            return "v"
+
+        resolved: list[object] = []
+        for event in events:
+            if event == "WAIT_BUSY":
+                resolved.append(wait_busy)
+            elif event == "RELEASE_THEN_VIDEO":
+                resolved.append(release_then_video)
+            else:
+                resolved.append(event)
+        source.events = resolved
+
+        code = run_interactive_session(core, source, writer, camera=session)
+        session.close(timeout_s=5.0)
+        records = parse_ndjson(output)
+        return code, fake, records, app, session
+
+    def test_photo_without_camera_reports_skipped(self) -> None:
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        source = EventSource(["p", "v", "q"])
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        code = run_interactive_session(core, source, writer)
+        records = parse_ndjson(output)
+        self.assertEqual(code, 0)
+        photo_records = [
+            record for record in records if record["action"] in ("PHOTO", "VIDEO")
+        ]
+        self.assertEqual(len(photo_records), 2)
+        for record in photo_records:
+            self.assertEqual(record["outcome"], "SKIPPED")
+            self.assertEqual(record["error_code"], "CAMERA_NOT_ENABLED")
+        self.assertEqual(fake.count("set_chassis"), 0)
+
+    def test_photo_and_video_during_motion_are_non_blocking(self) -> None:
+        app = CameraFakeApp()
+        code, fake, records, app, session = self.run_with_camera(
+            ["r", "w", "p", "WAIT_BUSY", "RELEASE_THEN_VIDEO", "q"], app
+        )
+        self.assertEqual(code, 0)
+
+        def records_for(event: str, action: str | None = None):
+            selected = [
+                record for record in records if record["event"] == event
+            ]
+            if action is None:
+                return selected
+            return [
+                record
+                for record in selected
+                if record.get("camera_action") == action
+            ]
+
+        # driving still works and is untouched by camera work
+        self.assertEqual(fake.count("arm"), 1)
+        self.assertEqual(fake.count("set_chassis"), 1)
+        self.assertEqual(
+            [record["action"] for record in records if record["event"] == "key"],
+            ["ARM", "W", "PHOTO", "PHOTO", "VIDEO"],
+        )
+        key_outcomes = {}
+        for record in records:
+            if record["event"] == "key":
+                key_outcomes.setdefault(record["action"], record["outcome"])
+        self.assertEqual(key_outcomes["W"], "COMPLETED")
+        self.assertEqual(key_outcomes["VIDEO"], "ACCEPTED")
+        # first P accepted, second P reported BUSY while camera thread worked
+        photo_keys = [
+            record
+            for record in records
+            if record["event"] == "key" and record["action"] == "PHOTO"
+        ]
+        self.assertEqual(
+            [record["outcome"] for record in photo_keys],
+            ["ACCEPTED", "BUSY"],
+        )
+        self.assertEqual(photo_keys[1]["error_code"], "CAMERA_BUSY")
+
+        # camera results flow back as capture events with session identity
+        ready = records_for("capture")[0]
+        self.assertEqual(ready["camera_event"], "READY")
+        key_results = records_for("capture", "PHOTO") + records_for(
+            "capture", "VIDEO_TOGGLE"
+        )
+        self.assertEqual(
+            [record["outcome"] for record in key_results],
+            ["COMPLETED", "COMPLETED"],
+        )
+        self.assertEqual(
+            [record["message"] for record in key_results],
+            ["photo_captured", "recording_started"],
+        )
+        closed = [
+            record
+            for record in records_for("capture")
+            if record["camera_event"] == "CLOSED"
+        ]
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]["outcome"], "OK")
+        self.assertEqual(closed[0]["session_id"], "20260815T120000_fake0001")
+        self.assertIn("inventory/transfer", closed[0]["message"])
+        self.assertEqual(app.shutdown_calls, [("teleop_exit", True)])
+        # cleanup still safe-stops through the formal chain
+        self.assertEqual(
+            [record.operation for record in fake.history][-2:],
+            ["safe_stop", "close"],
+        )
+
+    def test_camera_init_failure_degrades_to_events(self) -> None:
+        import time as _time
+
+        from rescue_control.capture import (
+            CaptureUnavailableError,
+            TeleopCameraSession,
+        )
+
+        class FailingApp:
+            def initialize(self):
+                raise CaptureUnavailableError("no cameras on this host")
+
+        app = FailingApp()
+        clock = ManualClock()
+        fake = FakeLowerLink(clock)
+        core = make_interactive_core(fake, clock)
+        output = io.StringIO()
+        source = EventSource(["p", "q"])
+        session = TeleopCameraSession(lambda: app)  # type: ignore[arg-type]
+        writer = OutputWriter(output, json_mode=True, clock=clock)
+        session.start()
+
+        # let the worker fail initialization before the loop starts
+        deadline = _time.monotonic() + 5.0
+        while not session.closed and _time.monotonic() < deadline:
+            _time.sleep(0.005)
+        self.assertTrue(session.closed)
+
+        code = run_interactive_session(core, source, writer, camera=session)
+        records = parse_ndjson(output)
+        self.assertEqual(code, 0)
+        unavailable = [
+            record
+            for record in records
+            if record["event"] == "capture"
+            and record["camera_event"] == "UNAVAILABLE"
+        ]
+        self.assertEqual(len(unavailable), 1)
+        self.assertIn("no cameras", unavailable[0]["message"])
+        photo = [
+            record
+            for record in records
+            if record["event"] == "key" and record["action"] == "PHOTO"
+        ]
+        self.assertEqual(photo[0]["outcome"], "UNAVAILABLE")
+        self.assertEqual(photo[0]["error_code"], "CAMERA_SESSION_CLOSED")
+        self.assertEqual(
+            [record.operation for record in fake.history][-2:],
+            ["safe_stop", "close"],
+        )
+
+
+class CameraFakeApp:
+    """Minimal camera app double used by CameraSessionIntegrationTests."""
+
+    session_id = "20260815T120000_fake0001"
+    session_dir = "/tmp/fake-session-dir"
+
+    def __init__(self) -> None:
+        import threading
+
+        self.store = type(
+            "Store",
+            (),
+            {"session_id": self.session_id, "session_dir": self.session_dir},
+        )()
+        self.keys: list[str] = []
+        self.shutdown_calls: list[tuple[str, bool]] = []
+        self.gate = threading.Event()
+
+    def initialize(self) -> None:
+        pass
+
+    def handle_key(self, key: str, now: float | None = None) -> str:
+        self.keys.append(key)
+        self.gate.wait(5.0)
+        return {
+            "p": "photo_captured",
+            "v": "recording_started",
+        }.get(key, "ignored")
+
+    def poll(self) -> None:
+        pass
+
+    def shutdown(self, reason: str, graceful: bool) -> list[str]:
+        self.shutdown_calls.append((reason, graceful))
+        return []
 
 
 if __name__ == "__main__":
